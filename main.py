@@ -6,12 +6,13 @@ import traceback
 import time
 from collections import deque
 from datetime import datetime, timezone
-from urllib.parse import unquote # Para decodificar URL
+from urllib.parse import unquote
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser
+from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 
 # --- Configuración ---
 
@@ -43,7 +44,8 @@ threading.Thread(
 def run_coro(coro):
     """Ejecuta una corrutina en el bucle principal y espera el resultado."""
     fut = asyncio.run_coroutine_threadsafe(coro, loop)
-    return fut.result()
+    # Espera hasta 30 segundos más allá del timeout de la API
+    return fut.result(timeout=35) 
 
 # --- Configuración del Cliente Telegram ---
 
@@ -60,7 +62,9 @@ client = TelegramClient(session, API_ID, API_HASH, loop=loop)
 # Mensajes en memoria (usaremos esto como caché de respuestas)
 messages = deque(maxlen=2000)
 _messages_lock = threading.Lock()
-# Diccionario para esperar respuestas específicas: {command_id: asyncio.Future}
+
+# Diccionario para esperar respuestas específicas: 
+# {command_id: {"future": asyncio.Future, "messages": list, "timer": asyncio.TimerHandle}}
 response_waiters = {} 
 
 # Login pendiente
@@ -81,17 +85,21 @@ def clean_and_extract(raw_text: str):
     
     # 2. Eliminar cabecera (patrón más robusto)
     # Buscamos la cabecera hasta "==============================\s*"
-    header_pattern = r"^\[CONSULTA PE\].*?==============================\s*"
+    # Eliminamos el encabezado que contiene [CONSULTA PE] o [#LEDER_BOT]
+    header_pattern = r"^\[.*?\]\s*→\s*.*?\[.*?\](\r?\n){1,2}"
     text = re.sub(header_pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
     
     # 3. Eliminar pie (patrón más robusto para créditos/paginación/warnings al final)
     footer_pattern = r"((\r?\n){1,2}\[|Página\s*\d+\/\d+.*|(\r?\n){1,2}Por favor, usa el formato correcto.*|↞ Anterior|Siguiente ↠.*|Credits\s*:.+|Wanted for\s*:.+)"
     text = re.sub(footer_pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
     
-    # 4. Limpiar espacios
+    # 4. Limpiar separador (si queda)
+    text = re.sub(r"\-{3,}", "", text, flags=re.IGNORECASE | re.DOTALL)
+
+    # 5. Limpiar espacios
     text = text.strip()
 
-    # 5. Extraer datos clave (ajustar si el bot devuelve un formato diferente)
+    # 6. Extraer datos clave
     fields = {}
     dni_match = re.search(r"DNI\s*:\s*(\d+)", text, re.IGNORECASE)
     if dni_match: fields["dni"] = dni_match.group(1)
@@ -120,34 +128,106 @@ async def _on_new_message(event):
             "date": event.message.date.isoformat() if getattr(event, "message", None) else datetime.utcnow().isoformat(),
             "message": cleaned["text"],
             "fields": cleaned["fields"],
+            "urls": [] # Ahora es una lista
         }
         
-        # 2. Manejar archivos (media)
+        # 2. Manejar archivos (media): Descarga TODOS los archivos adjuntos
         if getattr(event, "message", None) and getattr(event.message, "media", None):
-            try:
-                # Usar datetime.now(timezone.utc) para un nombre de archivo consistente
-                timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
-                # Obtener la extensión original si es posible, o usar 'file'
-                file_ext = os.path.splitext(getattr(event.message.file, 'name', 'file'))[1]
-                
-                unique_filename = f"{timestamp_str}_{event.message.id}_{event.message.file.name or 'file'}"
-                
-                saved_path = await event.download_media(file=os.path.join(DOWNLOAD_DIR, unique_filename))
-                filename = os.path.basename(saved_path)
-                msg_obj["url"] = f"{PUBLIC_URL}/files/{filename}"
-            except Exception as e:
-                msg_obj["media_error"] = str(e)
-        
+            media_list = []
+            if isinstance(event.message.media, (MessageMediaDocument, MessageMediaPhoto)):
+                media_list.append(event.message.media)
+            elif hasattr(event.message.media, 'webpage') and event.message.media.webpage and hasattr(event.message.media.webpage, 'photo'):
+                 # Esto podría ser una imagen de preview, la ignoramos o la manejamos si es necesario.
+                 pass
+            
+            # Buscar otros archivos si el mensaje es un álbum o tiene más de un archivo.
+            # Telethon normalmente maneja los álbumes con un solo evento de mensaje.
+            
+            if media_list or event.message.grouped_id:
+                try:
+                    # Usar datetime.now(timezone.utc) para un nombre de archivo consistente
+                    timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+                    
+                    # Si hay un grouped_id (álbum), el evento puede contener todos los mensajes
+                    # Pero en la práctica, para un bot, cada foto/archivo suele ser un evento NewMessage.
+                    # El siguiente código está optimizado para un solo archivo por mensaje,
+                    # pero maneja cualquier media que se encuentre.
+                    
+                    for i, media in enumerate(media_list):
+                        # Obtener la extensión original si es posible, o usar 'file'
+                        if hasattr(media, 'document') and hasattr(media.document, 'attributes'):
+                            file_ext = os.path.splitext(getattr(media.document, 'file_name', 'file'))[1]
+                        elif isinstance(media, MessageMediaPhoto) or (hasattr(media, 'photo') and media.photo):
+                            file_ext = '.jpg' # La foto de Telegram suele ser JPG
+                        else:
+                            file_ext = '.file'
+                            
+                        # Si hay un DNI, lo incluimos en el nombre
+                        dni_part = f"_{cleaned['fields'].get('dni')}" if cleaned["fields"].get("dni") else ""
+                        
+                        unique_filename = f"{timestamp_str}_{event.message.id}{dni_part}_{i}{file_ext}"
+                        
+                        # Descargar el medio
+                        saved_path = await client.download_media(event.message, file=os.path.join(DOWNLOAD_DIR, unique_filename))
+                        filename = os.path.basename(saved_path)
+                        msg_obj["urls"].append(f"{PUBLIC_URL}/files/{filename}")
+                        
+                        # Manejo especial para /dnivaz (anverso/reverso)
+                        if "DNI VIRTUAL AZUL" in raw_text:
+                            if "ANVERSO" not in raw_text.upper() and "REVERSO" not in raw_text.upper():
+                                # Intentar adivinar, si el bot no lo pone
+                                side_match = re.search(r"(ANVERSO|REVERSO)", unique_filename.upper())
+                                if side_match:
+                                    msg_obj["urls"][-1] = {"url": msg_obj["urls"][-1], "side": side_match.group(1)}
+                                else:
+                                    msg_obj["urls"][-1] = {"url": msg_obj["urls"][-1], "side": f"UNKNOWN_{i+1}"}
+                            
+                except Exception as e:
+                    msg_obj["media_error"] = str(e)
+                    
         # 3. Intentar resolver la espera de la API
         resolved = False
         with _messages_lock:
-            if len(response_waiters) > 0:
-                command_id_to_resolve = list(response_waiters.keys())[0] 
-                future = response_waiters.pop(command_id_to_resolve, None)
-                if future and not future.done():
-                    loop.call_soon_threadsafe(future.set_result, msg_obj)
+            # Iterar sobre las esperas activas. Solo hay una, pero por seguridad.
+            keys_to_check = list(response_waiters.keys())
+            for command_id in keys_to_check:
+                waiter_data = response_waiters.get(command_id)
+                if not waiter_data: continue
+
+                # Condición de resolución: El DNI en el mensaje coincide con el DNI del comando.
+                # Para comandos sin DNI (ej. /tel) se debe confiar en el orden de llegada.
+                command_dni = waiter_data.get("dni")
+                message_dni = cleaned["fields"].get("dni")
+                
+                # Para /dnivaz, es crucial obtener ambos. Usaremos un timeout corto.
+                if command_dni and command_dni == message_dni:
+                    waiter_data["messages"].append(msg_obj)
+                    
+                    # Lógica de finalización para DNI VIRTUAL AZUL (2 mensajes esperados)
+                    if len(waiter_data["messages"]) >= 2 and waiter_data["command"].startswith("/dnivaz"):
+                        loop.call_soon_threadsafe(waiter_data["future"].set_result, waiter_data["messages"])
+                        waiter_data["timer"].cancel() # Cancelar el timer de timeout
+                        response_waiters.pop(command_id, None)
+                        resolved = True
+                        break
+                        
+                    # Lógica de finalización para otros comandos (1 mensaje esperado)
+                    elif not waiter_data["command"].startswith("/dnivaz") and len(waiter_data["messages"]) >= 1:
+                        loop.call_soon_threadsafe(waiter_data["future"].set_result, waiter_data["messages"][0])
+                        waiter_data["timer"].cancel() # Cancelar el timer de timeout
+                        response_waiters.pop(command_id, None)
+                        resolved = True
+                        break
+                        
+                # Si no hay DNI, asumimos que el primer mensaje es la respuesta
+                elif not command_dni and not waiter_data["command"].startswith("/dnivaz"):
+                    waiter_data["messages"].append(msg_obj)
+                    loop.call_soon_threadsafe(waiter_data["future"].set_result, waiter_data["messages"][0])
+                    waiter_data["timer"].cancel() # Cancelar el timer de timeout
+                    response_waiters.pop(command_id, None)
                     resolved = True
-        
+                    break
+
         # 4. Agregar a la cola de historial si no se usó para una respuesta específica
         if not resolved:
             with _messages_lock:
@@ -161,7 +241,7 @@ client.add_event_handler(_on_new_message, events.NewMessage(incoming=True))
 # --- Función Central para Llamadas API (Comandos) ---
 
 async def _call_api_command(command: str, timeout: int = 25):
-    """Envía un comando al bot y espera la respuesta."""
+    """Envía un comando al bot y espera la respuesta(s)."""
     if not await client.is_user_authorized():
         raise Exception("Cliente no autorizado. Por favor, inicie sesión.")
 
@@ -169,30 +249,83 @@ async def _call_api_command(command: str, timeout: int = 25):
     command_id = time.time() # ID temporal
     future = loop.create_future()
     
+    # Extraer DNI del comando si existe
+    dni_match = re.search(r"/\w+\s+(\d{8})", command)
+    dni = dni_match.group(1) if dni_match else None
+    
+    waiter_data = {
+        "future": future,
+        "messages": [],
+        "dni": dni,
+        "command": command,
+        "timer": None # Se asigna después
+    }
+    
+    # Función de timeout para el Future
+    def _on_timeout():
+        with _messages_lock:
+            waiter_data = response_waiters.pop(command_id, None)
+            if waiter_data and not waiter_data["future"].done():
+                loop.call_soon_threadsafe(
+                    waiter_data["future"].set_result, 
+                    {"status": "error", "message": f"Tiempo de espera de respuesta agotado ({timeout}s) para el comando: {command}."}
+                )
+
+    # Establecer el timer de timeout en el loop de Telethon
+    waiter_data["timer"] = loop.call_later(timeout, _on_timeout)
+
     with _messages_lock:
-        response_waiters[command_id] = future # Agregar al diccionario de espera
+        response_waiters[command_id] = waiter_data
 
     try:
         # 2. Enviar el mensaje al bot
         await client.send_message(LEDERDATA_BOT_ID, command)
         
-        # 3. Esperar la respuesta
-        result = await asyncio.wait_for(future, timeout=timeout)
+        # 3. Esperar la respuesta (o lista de respuestas)
+        result = await future
         
         # Si la respuesta es un mensaje de error del bot, lo manejamos
         if isinstance(result, dict) and "Por favor, usa el formato correcto" in result.get("message", ""):
              return {"status": "error_bot_format", "message": result.get("message")}
         
+        # Manejar el caso de /dnivaz para consolidar en un solo JSON
+        if isinstance(result, list) and command.startswith("/dnivaz"):
+            # Deberían ser 2 mensajes. Si es 1 o 0, el timeout ya lo manejó o está incompleto.
+            if len(result) < 2:
+                return {"status": "error", "message": f"Solo se recibió {len(result)} de 2 partes para /dnivaz. Puede haber expirado el tiempo de espera."}
+
+            final_result = result[0].copy() # Clonar el primer resultado
+            final_result["full_response"] = [] # Para el texto completo
+            final_result["urls"] = [] # Para las URLs consolidadas
+            
+            # Recorrer los mensajes y consolidar
+            for msg in result:
+                final_result["full_response"].append(msg["message"])
+                final_result["urls"].extend(msg["urls"])
+                
+                # Se espera que el primer mensaje tenga los campos (DNI, Nombres, etc.)
+                # Pero si no los tiene, los copiamos del que los tenga.
+                if not final_result["fields"].get("dni") and msg["fields"].get("dni"):
+                    final_result["fields"] = msg["fields"]
+
+            final_result["message"] = " | ".join(final_result["full_response"])
+            final_result.pop("full_response")
+            return final_result
+            
+        # Para todos los demás comandos, el resultado es un único mensaje (dict)
         return result
         
-    except asyncio.TimeoutError:
-        return {"status": "error", "message": f"Tiempo de espera de respuesta agotado ({timeout}s)."}
     except Exception as e:
-        return {"status": "error", "message": f"Error de Telethon/conexión: {str(e)}"}
+        # Si hay un error, el futuro se canceló o falló.
+        return {"status": "error", "message": f"Error de Telethon/conexión/timeout: {str(e)}"}
     finally:
-        # 4. Limpieza: Asegurar que el Future se elimine
+        # 4. Limpieza: Asegurar que el Future y el Timer se eliminen si no se hizo en _on_new_message
         with _messages_lock:
-            response_waiters.pop(command_id, None)
+            if command_id in response_waiters:
+                waiter_data = response_waiters.pop(command_id, None)
+                if waiter_data and waiter_data["timer"]:
+                    waiter_data["timer"].cancel()
+
 
 # --- Rutina de reconexión / ping ---
 
@@ -201,9 +334,18 @@ async def _ensure_connected():
     while True:
         try:
             if not client.is_connected():
+                print("🔌 Intentando reconectar Telethon...")
                 await client.connect()
+                # Intentar obtener la entidad del bot de nuevo después de la reconexión
+                await client.get_entity(LEDERDATA_BOT_ID) 
+                print("✅ Reconexión exitosa.")
+            elif not await client.is_user_authorized():
+                 print("⚠️ Telethon conectado, pero no autorizado.")
+            # Un ping simple para mantener viva la conexión
+            await client.get_dialogs(limit=1) 
+
         except Exception:
-            traceback.print_exc()
+            tracebox.print_exc()
         await asyncio.sleep(300) # Dormir 5 minutos
 
 asyncio.run_coroutine_threadsafe(_ensure_connected(), loop)
@@ -395,9 +537,14 @@ def api_dni_based_command():
     
     # Ejecutar comando
     try:
-        result = run_coro(_call_api_command(command))
+        # Aumentar el timeout para /dnivaz y /dnif (más tráfico, más tiempo de descarga)
+        timeout = 30 if command_name in ["dnivaz", "dnif"] else 25
+        result = run_coro(_call_api_command(command, timeout=timeout))
+        
         if result.get("status", "").startswith("error"):
-            return jsonify(result), 500
+            # Devolver 500 si hay un error de conexión/timeout, 400 para error de formato del bot
+            status_code = 500 if "timeout" in result.get("message", "").lower() or "telethon" in result.get("message", "").lower() else 400
+            return jsonify(result), status_code
         return jsonify(result)
     except Exception as e:
         return jsonify({"status": "error", "message": f"Error interno: {str(e)}"}), 500
