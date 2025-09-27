@@ -5,7 +5,7 @@ import threading
 import traceback
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import unquote # Para decodificar URL
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -69,23 +69,29 @@ pending_phone = {"phone": None, "sent_at": None}
 # --- Lógica de Limpieza y Extracción de Datos ---
 
 def clean_and_extract(raw_text: str):
-    """Limpia el texto de cabeceras/pies y extrae campos clave."""
+    """Limpia el texto de cabeceras/pies y extrae campos clave. REEMPLAZA MARCA LEDER BOT."""
     if not raw_text:
         return {"text": "", "fields": {}}
 
     text = raw_text
-    # 1. Eliminar cabecera (patrón más robusto)
-    header_pattern = r"^\[\#LEDER\_BOT\].*?==============================\s*"
+    
+    # 1. Reemplazar la marca LEDER_BOT por CONSULTA PE
+    # Esto busca y reemplaza la primera ocurrencia de [#LEDER_BOT]
+    text = re.sub(r"^\[\#LEDER\_BOT\]", "[CONSULTA PE]", text, flags=re.IGNORECASE | re.DOTALL)
+    
+    # 2. Eliminar cabecera (patrón más robusto)
+    # Buscamos la cabecera hasta "==============================\s*"
+    header_pattern = r"^\[CONSULTA PE\].*?==============================\s*"
     text = re.sub(header_pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
     
-    # 2. Eliminar pie (patrón más robusto para créditos/paginación/warnings al final)
+    # 3. Eliminar pie (patrón más robusto para créditos/paginación/warnings al final)
     footer_pattern = r"((\r?\n){1,2}\[|Página\s*\d+\/\d+.*|(\r?\n){1,2}Por favor, usa el formato correcto.*|↞ Anterior|Siguiente ↠.*|Credits\s*:.+|Wanted for\s*:.+)"
     text = re.sub(footer_pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
     
-    # 3. Limpiar espacios
+    # 4. Limpiar espacios
     text = text.strip()
 
-    # 4. Extraer datos clave (ajustar si el bot devuelve un formato diferente)
+    # 5. Extraer datos clave (ajustar si el bot devuelve un formato diferente)
     fields = {}
     dni_match = re.search(r"DNI\s*:\s*(\d+)", text, re.IGNORECASE)
     if dni_match: fields["dni"] = dni_match.group(1)
@@ -103,8 +109,6 @@ async def _on_new_message(event):
             if event.sender_id != bot_entity.id:
                 return # Ignorar mensajes que no sean del bot
         except Exception:
-            # Si no se encuentra la entidad, puede fallar si el bot nunca ha enviado un mensaje.
-            # Se permite continuar si el sender_id parece ser un usuario o canal.
             pass
 
         raw_text = event.raw_text or ""
@@ -121,7 +125,13 @@ async def _on_new_message(event):
         # 2. Manejar archivos (media)
         if getattr(event, "message", None) and getattr(event.message, "media", None):
             try:
-                unique_filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{event.message.id}_{event.message.file.name or 'file'}"
+                # Usar datetime.now(timezone.utc) para un nombre de archivo consistente
+                timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+                # Obtener la extensión original si es posible, o usar 'file'
+                file_ext = os.path.splitext(getattr(event.message.file, 'name', 'file'))[1]
+                
+                unique_filename = f"{timestamp_str}_{event.message.id}_{event.message.file.name or 'file'}"
+                
                 saved_path = await event.download_media(file=os.path.join(DOWNLOAD_DIR, unique_filename))
                 filename = os.path.basename(saved_path)
                 msg_obj["url"] = f"{PUBLIC_URL}/files/{filename}"
@@ -131,12 +141,10 @@ async def _on_new_message(event):
         # 3. Intentar resolver la espera de la API
         resolved = False
         with _messages_lock:
-            # Asumimos que el último Future creado está esperando esta respuesta
             if len(response_waiters) > 0:
                 command_id_to_resolve = list(response_waiters.keys())[0] 
                 future = response_waiters.pop(command_id_to_resolve, None)
                 if future and not future.done():
-                    # Usamos call_soon_threadsafe para resolver el Future en el thread de Telethon
                     loop.call_soon_threadsafe(future.set_result, msg_obj)
                     resolved = True
         
@@ -144,7 +152,6 @@ async def _on_new_message(event):
         if not resolved:
             with _messages_lock:
                 messages.appendleft(msg_obj)
-                # print("📥 Nuevo mensaje de bot (historial):", msg_obj)
 
     except Exception:
         traceback.print_exc() 
@@ -158,8 +165,6 @@ async def _call_api_command(command: str, timeout: int = 25):
     if not await client.is_user_authorized():
         raise Exception("Cliente no autorizado. Por favor, inicie sesión.")
 
-    # print(f"📡 Enviando comando a {LEDERDATA_BOT_ID}: {command}")
-    
     # 1. Crear un Future para esperar la respuesta
     command_id = time.time() # ID temporal
     future = loop.create_future()
@@ -173,7 +178,6 @@ async def _call_api_command(command: str, timeout: int = 25):
         
         # 3. Esperar la respuesta
         result = await asyncio.wait_for(future, timeout=timeout)
-        # print("✅ Comando ejecutado, respuesta recibida.")
         
         # Si la respuesta es un mensaje de error del bot, lo manejamos
         if isinstance(result, dict) and "Por favor, usa el formato correcto" in result.get("message", ""):
@@ -182,10 +186,8 @@ async def _call_api_command(command: str, timeout: int = 25):
         return result
         
     except asyncio.TimeoutError:
-        # print(f"❌ Tiempo de espera agotado ({timeout}s) para el comando: {command}")
         return {"status": "error", "message": f"Tiempo de espera de respuesta agotado ({timeout}s)."}
     except Exception as e:
-        # print(f"❌ Error al ejecutar comando: {e}")
         return {"status": "error", "message": f"Error de Telethon/conexión: {str(e)}"}
     finally:
         # 4. Limpieza: Asegurar que el Future se elimine
@@ -200,13 +202,8 @@ async def _ensure_connected():
         try:
             if not client.is_connected():
                 await client.connect()
-                # print("🔌 Reconectando Telethon...")
-            
-            # if not await client.is_user_authorized():
-                 # print("⚠️ Cliente no autorizado o desconectado. Necesita iniciar sesión.")
-
         except Exception:
-            tracebox.print_exc()
+            traceback.print_exc()
         await asyncio.sleep(300) # Dormir 5 minutos
 
 asyncio.run_coroutine_threadsafe(_ensure_connected(), loop)
@@ -218,7 +215,6 @@ def root():
     return jsonify({
         "status": "ok",
         "message": "Gateway API para LEDER DATA Bot activo. Consulta /status para la sesión.",
-        "endpoints_doc": "Revisa tu documentación para la lista completa de endpoints.",
     })
 
 @app.route("/status")
@@ -244,7 +240,6 @@ def status():
 
 @app.route("/login")
 def login():
-    # ... (código de login, no modificado) ...
     phone = request.args.get("phone")
     if not phone: return jsonify({"error": "Falta parámetro phone"}), 400
 
@@ -263,7 +258,6 @@ def login():
 
 @app.route("/code")
 def code():
-    # ... (código de code, no modificado) ...
     code = request.args.get("code")
     if not code: return jsonify({"error": "Falta parámetro code"}), 400
     if not pending_phone["phone"]: return jsonify({"error": "No hay login pendiente"}), 400
@@ -285,7 +279,6 @@ def code():
 
 @app.route("/send")
 def send_msg():
-    # ESTA RUTA ES PARA MENSAJES MANUALES. NO RECOMENDADA PARA LA API.
     chat_id = request.args.get("chat_id")
     msg = request.args.get("msg")
     if not chat_id or not msg:
@@ -313,7 +306,11 @@ def get_msgs():
 
 @app.route("/files/<path:filename>")
 def files(filename):
-    return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=False)
+    """
+    Ruta para descargar archivos. Se añade as_attachment=True para forzar la descarga.
+    Esta es la solución del backend para la descarga automática.
+    """
+    return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
 
 # ----------------------------------------------------------------------
 # --- Rutas HTTP de API (Comandos LEDER DATA) ----------------------------
@@ -360,6 +357,10 @@ def files(filename):
 @app.route("/seeker", methods=["GET"]) # SEEKER
 @app.route("/afp", methods=["GET"]) # AFPS
 @app.route("/bdir", methods=["GET"]) # DIRECCION INVERSA
+@app.route("/antpenv", methods=["GET"]) # ANTECEDENTES PENALES VERIFICADOR
+@app.route("/dend", methods=["GET"]) # DENUNCIAS POLICIALES (DNI)
+@app.route("/dence", methods=["GET"]) # DENUNCIAS POLICIALES (CE)
+@app.route("/denpas", methods=["GET"]) # DENUNCIAS POLICIALES (PASAPORTE)
 def api_dni_based_command():
     """
     Maneja comandos que solo requieren un DNI o un parámetro simple.
@@ -375,16 +376,16 @@ def api_dni_based_command():
             return jsonify({"status": "error", "message": f"Parámetro 'dni' es requerido y debe ser un número de 8 dígitos para /{command_name}."}), 400
     elif command_name in ["tel", "telp", "cor", "antpenv", "dend", "dence", "denpas", "nmv", "cedula"]:
         param = request.args.get("query")
-        if not param:
+        # En /dence y /denpas el bot espera un documento, si no se pasa, puede fallar el comando.
+        # Asumiremos que 'query' es el parámetro para todos ellos.
+        if not param and command_name not in ["osiptel", "claro", "entel", "seeker", "bdir", "pasaporte"]:
             return jsonify({"status": "error", "message": f"Parámetro 'query' es requerido para /{command_name}."}), 400
     elif command_name in ["ce"]:
         param = request.args.get("ce")
         if not param:
             return jsonify({"status": "error", "message": f"Parámetro 'ce' es requerido para /{command_name}."}), 400
     else:
-        # Otros comandos que asumen DNI por defecto o simplemente necesitan un parámetro.
-        # Por simplicidad, asumiremos que usan 'dni' o 'query' si lo necesitan
-        # y si no se pasan, el comando se envía sin parámetros (ej: /osiptel, /seeker, etc. si el bot lo acepta).
+        # Comandos que pueden ir sin parámetro (ej: /osiptel, /seeker, etc.)
         param_dni = request.args.get("dni")
         param_query = request.args.get("query")
         param = param_dni or param_query or ""
