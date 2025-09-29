@@ -5,7 +5,7 @@ import threading
 import traceback
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import unquote
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -40,6 +40,33 @@ ALL_BOT_IDS = [LEDERDATA_BOT_ID, LEDERDATA_BACKUP_BOT_ID]
 TIMEOUT_PRIMARY_BOT_FAILOVER = 25 
 # Tiempo de espera total para la llamada a la API.
 TIMEOUT_TOTAL = 40 
+
+# --- Manejo de Fallos por Bot (Implementación de tu lógica) ---
+
+# Diccionario para rastrear los fallos por timeout: {bot_id: datetime_of_failure}
+bot_fail_tracker = {}
+BOT_FAIL_TIMEOUT_HOURS = 6 # Tiempo de bloqueo de 6 horas
+
+def is_bot_blocked(bot_id: str) -> bool:
+    """Verifica si el bot está temporalmente bloqueado por fallos previos."""
+    last_fail_time = bot_fail_tracker.get(bot_id)
+    if not last_fail_time:
+        return False
+
+    six_hours_ago = datetime.now() - timedelta(hours=BOT_FAIL_TIMEOUT_HOURS)
+
+    # Si la última falla fue más reciente que 'six_hours_ago', está bloqueado
+    if last_fail_time > six_hours_ago:
+        return True
+    
+    # Si ya pasó el tiempo, eliminamos el registro y permitimos el intento
+    bot_fail_tracker.pop(bot_id, None)
+    return False
+
+def record_bot_failure(bot_id: str):
+    """Registra la hora actual como la última hora de fallo del bot."""
+    print(f"🚨 Bot {bot_id} ha fallado por timeout y será BLOQUEADO por {BOT_FAIL_TIMEOUT_HOURS} horas.")
+    bot_fail_tracker[bot_id] = datetime.now()
 
 # --- Aplicación Flask ---
 
@@ -271,7 +298,7 @@ client.add_event_handler(_on_new_message, events.NewMessage(incoming=True))
 # --- Función Central para Llamadas API (Comandos) ---
 
 async def _call_api_command(command: str, timeout: int = 25):
-    """Envía un comando al bot y espera la respuesta(s), con lógica de respaldo."""
+    """Envía un comando al bot y espera la respuesta(s), con lógica de respaldo y bloqueo por fallo."""
     if not await client.is_user_authorized():
         raise Exception("Cliente no autorizado. Por favor, inicie sesión.")
 
@@ -281,15 +308,25 @@ async def _call_api_command(command: str, timeout: int = 25):
     dni_match = re.search(r"/\w+\s+(\d{8})", command)
     dni = dni_match.group(1) if dni_match else None
     
+    # Lista de bots a intentar
+    bots_to_try = [LEDERDATA_BOT_ID, LEDERDATA_BACKUP_BOT_ID]
+    
     # ----------------------------------------------------------------------
-    # Lógica de Intento 1: Bot Principal
+    # Lógica de Intento con Verificación de Bloqueo
     # ----------------------------------------------------------------------
     
-    current_bot_id = LEDERDATA_BOT_ID
-    
-    for attempt in range(1, 3): # Intentamos con el bot principal, y luego con el de respaldo si falla por timeout.
-        future = loop.create_future()
+    for attempt, current_bot_id in enumerate(bots_to_try, 1):
         
+        # 1. Verificar si el bot está bloqueado
+        if is_bot_blocked(current_bot_id) and attempt == 1:
+            print(f"🚫 Bot {current_bot_id} está BLOQUEADO temporalmente. Saltando al bot de respaldo.")
+            continue # Saltar al siguiente bot (el de respaldo)
+        elif is_bot_blocked(current_bot_id) and attempt == 2:
+            print(f"🚫 Bot de Respaldo {current_bot_id} también está BLOQUEADO. No hay bots disponibles.")
+            break # Salir del bucle, ambos fallaron
+
+        # 2. Preparar el Future y Waiter
+        future = loop.create_future()
         waiter_data = {
             "future": future,
             "messages": [],
@@ -299,46 +336,48 @@ async def _call_api_command(command: str, timeout: int = 25):
             "sent_to_bot": current_bot_id
         }
         
-        # Usamos un tiempo de espera más corto para el primer intento, 
-        # y el timeout total para el segundo (si se usa el de respaldo).
         current_timeout = timeout if attempt == 1 else TIMEOUT_TOTAL
         
         # Función de timeout para el Future
-        def _on_timeout():
+        def _on_timeout(bot_id_on_timeout=current_bot_id):
             with _messages_lock:
                 waiter_data = response_waiters.pop(command_id, None)
                 if waiter_data and not waiter_data["future"].done():
-                    # Si falla el intento 1 por timeout, el resultado será un error de timeout.
-                    # Si falla el intento 2 (respaldo), el resultado será un error final.
+                    # 🚨 1. Registrar la falla del bot
+                    record_bot_failure(bot_id_on_timeout)
+                    
+                    # 🚨 2. Resolver el future con un error de timeout
                     loop.call_soon_threadsafe(
                         waiter_data["future"].set_result, 
-                        {"status": "error_timeout", "message": f"Tiempo de espera de respuesta agotado ({current_timeout}s) para el comando: {command}.", "bot": current_bot_id}
+                        {"status": "error_timeout", "message": f"Tiempo de espera de respuesta agotado ({current_timeout}s) para el comando: {command}.", "bot": bot_id_on_timeout, "fail_recorded": True}
                     )
 
         # Establecer el timer de timeout en el loop de Telethon
         waiter_data["timer"] = loop.call_later(current_timeout, _on_timeout)
 
         with _messages_lock:
+            # 🚨 3. Usamos el mismo command_id pero actualizamos el waiter_data
             response_waiters[command_id] = waiter_data
 
-        print(f"📡 Enviando comando ({attempt}/2) a {current_bot_id}: {command}")
+        print(f"📡 Enviando comando (Intento {attempt}) a {current_bot_id}: {command}")
         
         try:
-            # 2. Enviar el mensaje al bot
+            # 4. Enviar el mensaje al bot
             await client.send_message(current_bot_id, command)
             
-            # 3. Esperar la respuesta (o lista de respuestas)
+            # 5. Esperar la respuesta (o lista de respuestas)
             result = await future
             
-            # Si el resultado es un timeout del intento 1, pasamos al intento 2.
+            # 6. Si el resultado es un timeout, pasamos al siguiente bot.
             if isinstance(result, dict) and result.get("status") == "error_timeout" and attempt == 1:
-                # ----------------------------------------------------------------------
-                # Lógica de Intento 2: Bot de Respaldo
-                # ----------------------------------------------------------------------
+                # El bot principal falló. El future del intento 1 ya fue resuelto con el error de timeout y su entrada en response_waiters ya se eliminó en _on_timeout.
                 print(f"⌛ Timeout de {LEDERDATA_BOT_ID}. Intentando con {LEDERDATA_BACKUP_BOT_ID}.")
-                current_bot_id = LEDERDATA_BACKUP_BOT_ID
-                # El bucle for continuará a la siguiente iteración (attempt=2)
-                continue 
+                continue # Pasa al siguiente intento/bot
+            elif isinstance(result, dict) and result.get("status") == "error_timeout" and attempt == 2:
+                # El bot de respaldo falló también. Retornar el error final.
+                return result 
+            
+            # Si se llega aquí, el comando fue exitoso con el bot actual.
             
             # Si la respuesta es un mensaje de error del bot, lo manejamos
             if isinstance(result, dict) and "Por favor, usa el formato correcto" in result.get("message", ""):
@@ -413,26 +452,32 @@ async def _call_api_command(command: str, timeout: int = 25):
             return result
             
         except Exception as e:
-            # Si hay un error, el futuro se canceló o falló.
+            # Si hay un error de Telethon/conexión.
             error_msg = f"Error de Telethon/conexión/fallo: {str(e)}"
             if attempt == 1:
                 print(f"❌ Error en {LEDERDATA_BOT_ID}: {error_msg}. Intentando con {LEDERDATA_BACKUP_BOT_ID}.")
-                current_bot_id = LEDERDATA_BACKUP_BOT_ID
-                # El bucle for continuará a la siguiente iteración (attempt=2)
+                # 🚨 Registrar la falla por error de conexión
+                record_bot_failure(LEDERDATA_BOT_ID)
                 continue
             else:
                 # Si falla el intento 2, retornamos el error final.
                 return {"status": "error", "message": error_msg, "bot": current_bot_id}
         finally:
-            # 4. Limpieza: Asegurar que el Future y el Timer se eliminen si no se hizo en _on_new_message
+            # 7. Limpieza final: Asegurar que el Future y el Timer se eliminen si no se hizo en _on_new_message o _on_timeout
             with _messages_lock:
                 if command_id in response_waiters:
                     waiter_data = response_waiters.pop(command_id, None)
                     if waiter_data and waiter_data["timer"]:
                         waiter_data["timer"].cancel()
 
-    # Si se llegó aquí es porque el loop terminó después de los 2 intentos.
-    return {"status": "error", "message": f"Falló la consulta después de 2 intentos (Bot principal y de respaldo). Último intento con {current_bot_id} agotó el tiempo de espera.", "bot": current_bot_id}
+    # Si se llegó aquí es porque ambos bots fallaron o estaban bloqueados.
+    final_bot = LEDERDATA_BACKUP_BOT_ID
+    if is_bot_blocked(LEDERDATA_BOT_ID) and not is_bot_blocked(LEDERDATA_BACKUP_BOT_ID):
+         final_bot = LEDERDATA_BACKUP_BOT_ID
+    elif is_bot_blocked(LEDERDATA_BACKUP_BOT_ID) and not is_bot_blocked(LEDERDATA_BOT_ID):
+         final_bot = LEDERDATA_BOT_ID
+    
+    return {"status": "error", "message": f"Falló la consulta después de 2 intentos. Ambos bots están bloqueados o agotaron el tiempo de espera.", "bot": final_bot}
 
 
 # --- Rutina de reconexión / ping ---
@@ -482,11 +527,21 @@ def status():
     except Exception:
         pass
     
+    # Agregar estado de bloqueo de bots
+    bot_status = {}
+    for bot_id in ALL_BOT_IDS:
+        is_blocked = is_bot_blocked(bot_id)
+        bot_status[bot_id] = {
+            "blocked": is_blocked,
+            "last_fail": bot_fail_tracker.get(bot_id).isoformat() if bot_fail_tracker.get(bot_id) else None
+        }
+
     return jsonify({
         "authorized": bool(is_auth),
         "pending_phone": pending_phone["phone"],
         "session_loaded": True if SESSION_STRING else False,
         "session_string": current_session,
+        "bot_status": bot_status,
     })
 
 @app.route("/login")
