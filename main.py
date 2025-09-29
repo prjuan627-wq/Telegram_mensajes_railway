@@ -664,10 +664,18 @@ def files(filename):
 @app.route("/seeker", methods=["GET"]) # SEEKER
 @app.route("/afp", methods=["GET"]) # AFPS
 @app.route("/bdir", methods=["GET"]) # DIRECCION INVERSA
+@app.route("/meta", methods=["GET"]) # 🚨 METADATA COMPLETA (NUEVO)
+@app.route("/fis", methods=["GET"]) # 🚨 FISCALIA (NUEVO)
+@app.route("/det", methods=["GET"]) # 🚨 DETENIDOS (NUEVO)
+@app.route("/rqh", methods=["GET"]) # 🚨 REQUISITORIAS HISTORICAS (NUEVO)
 @app.route("/antpenv", methods=["GET"]) # ANTECEDENTES PENALES VERIFICADOR
 @app.route("/dend", methods=["GET"]) # DENUNCIAS POLICIALES (DNI)
-@app.route("/dence", methods=["GET"]) # DENUNCIAS POLICIALES (CE)
-@app.route("/denpas", methods=["GET"]) # DENUNCIAS POLICIALES (PASAPORTE)
+@app.route("/dence", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (CE) (NUEVO)
+@app.route("/denpas", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (PASAPORTE) (NUEVO)
+@app.route("/denci", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (CEDULA) (NUEVO)
+@app.route("/denp", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (PLACA) (NUEVO)
+@app.route("/denar", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (ARMAMENTO) (NUEVO)
+@app.route("/dencl", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (CLAVE) (NUEVO)
 def api_dni_based_command():
     """
     Maneja comandos que solo requieren un DNI o un parámetro simple.
@@ -676,26 +684,50 @@ def api_dni_based_command():
     
     command_name = request.path.lstrip('/') 
     
-    # Parámetro genérico. Se usa 'dni' para RENIEC, 'query' para /tel, etc.
-    dni_required_commands = ["dni", "dnif", "dnidb", "dnifdb", "c4", "dnivaz", "dnivam", "dnivel", "dniveln", "fa", "fadb", "fb", "fbdb", "cnv", "cdef", "antpen", "antpol", "antjud"]
+    # Comandos que esperan DNI de 8 dígitos
+    dni_required_commands = [
+        "dni", "dnif", "dnidb", "dnifdb", "c4", "dnivaz", "dnivam", "dnivel", "dniveln", 
+        "fa", "fadb", "fb", "fbdb", "cnv", "cdef", "antpen", "antpol", "antjud", 
+        "actancc", "actamcc", "actadcc", "tra", "sue", "cla", "sune", "cun", "colp", 
+        "mine", "afp", "antpenv", "dend", "meta", "fis", "det", "rqh" # Agregados al grupo de DNI
+    ]
     
+    # Comandos que esperan un parámetro de consulta genérico (query)
+    query_required_commands = [
+        "tel", "telp", "cor", "nmv", "tremp", # Otros
+        "dence", "denpas", "denci", "denp", "denar", "dencl", # Denuncias por otros docs/placa/clave
+        "fisdet" # Aunque no lo pediste, el formato de /fisdet es complejo, pero lo manejaremos genérico
+    ]
+    
+    # Comandos que toman DNI o query, o pueden ir sin nada (ej: /osiptel sin query da info general)
+    optional_commands = ["osiptel", "claro", "entel", "pro", "sen", "sbs", "pasaporte", "seeker", "bdir"]
+    
+    param = ""
+
     if command_name in dni_required_commands:
         param = request.args.get("dni")
         if not param or not param.isdigit() or len(param) != 8:
             return jsonify({"status": "error", "message": f"Parámetro 'dni' es requerido y debe ser un número de 8 dígitos para /{command_name}."}), 400
-    elif command_name in ["tel", "telp", "cor", "antpenv", "dend", "dence", "denpas", "nmv", "cedula"]:
+    
+    elif command_name in query_required_commands:
         param = request.args.get("query")
-        if not param and command_name not in ["osiptel", "claro", "entel", "seeker", "bdir", "pasaporte"]:
+        if not param:
             return jsonify({"status": "error", "message": f"Parámetro 'query' es requerido para /{command_name}."}), 400
+    
     elif command_name in ["ce"]:
         param = request.args.get("ce")
         if not param:
             return jsonify({"status": "error", "message": f"Parámetro 'ce' es requerido para /{command_name}."}), 400
-    else:
-        # Comandos que pueden ir sin parámetro (ej: /osiptel, /seeker, etc.)
+            
+    elif command_name in optional_commands:
         param_dni = request.args.get("dni")
         param_query = request.args.get("query")
         param = param_dni or param_query or ""
+        
+    else:
+        # En caso de que se añadan nuevos comandos no cubiertos por DNI o Query
+        param = request.args.get("dni") or request.args.get("query") or ""
+
         
     # Construir comando
     command = f"/{command_name} {param}".strip() # strip() elimina espacio si param está vacío
