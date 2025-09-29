@@ -44,8 +44,8 @@ threading.Thread(
 def run_coro(coro):
     """Ejecuta una corrutina en el bucle principal y espera el resultado."""
     fut = asyncio.run_coroutine_threadsafe(coro, loop)
-    # Espera hasta 30 segundos más allá del timeout de la API
-    return fut.result(timeout=35) 
+    # Espera hasta 35 segundos para comandos con descarga múltiple
+    return fut.result(timeout=40) 
 
 # --- Configuración del Cliente Telegram ---
 
@@ -64,7 +64,7 @@ messages = deque(maxlen=2000)
 _messages_lock = threading.Lock()
 
 # Diccionario para esperar respuestas específicas: 
-# {command_id: {"future": asyncio.Future, "messages": list, "timer": asyncio.TimerHandle}}
+# {command_id: {"future": asyncio.Future, "messages": list, "dni": str, "command": str, "timer": asyncio.TimerHandle}}
 response_waiters = {} 
 
 # Login pendiente
@@ -101,9 +101,14 @@ def clean_and_extract(raw_text: str):
 
     # 6. Extraer datos clave
     fields = {}
-    dni_match = re.search(r"DNI\s*:\s*(\d+)", text, re.IGNORECASE)
+    # Extracción de DNI de 8 dígitos
+    dni_match = re.search(r"DNI\s*:\s*(\d{8})", text, re.IGNORECASE)
     if dni_match: fields["dni"] = dni_match.group(1)
     
+    # Extracción de tipo de foto para /dnif y /dnivaz (para etiquetar las URLs)
+    photo_type_match = re.search(r"Foto\s*:\s*(rostro|huella|firma|adverso|reverso).*", text, re.IGNORECASE)
+    if photo_type_match: fields["photo_type"] = photo_type_match.group(1).lower()
+
     return {"text": text, "fields": fields}
 
 # --- Handler de nuevos mensajes ---
@@ -121,16 +126,10 @@ async def _on_new_message(event):
 
         raw_text = event.raw_text or ""
         cleaned = clean_and_extract(raw_text)
-
-        msg_obj = {
-            "chat_id": getattr(event, "chat_id", None),
-            "from_id": event.sender_id,
-            "date": event.message.date.isoformat() if getattr(event, "message", None) else datetime.utcnow().isoformat(),
-            "message": cleaned["text"],
-            "fields": cleaned["fields"],
-            "urls": [] # Ahora es una lista
-        }
         
+        # 🚨 Inicializar la lista de URLs para cada mensaje
+        msg_urls = []
+
         # 2. Manejar archivos (media): Descarga TODOS los archivos adjuntos
         if getattr(event, "message", None) and getattr(event.message, "media", None):
             media_list = []
@@ -140,18 +139,11 @@ async def _on_new_message(event):
                  # Esto podría ser una imagen de preview, la ignoramos o la manejamos si es necesario.
                  pass
             
-            # Buscar otros archivos si el mensaje es un álbum o tiene más de un archivo.
-            # Telethon normalmente maneja los álbumes con un solo evento de mensaje.
-            
-            if media_list or event.message.grouped_id:
+            # Si hay media, proceder a la descarga
+            if media_list:
                 try:
                     # Usar datetime.now(timezone.utc) para un nombre de archivo consistente
                     timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
-                    
-                    # Si hay un grouped_id (álbum), el evento puede contener todos los mensajes
-                    # Pero en la práctica, para un bot, cada foto/archivo suele ser un evento NewMessage.
-                    # El siguiente código está optimizado para un solo archivo por mensaje,
-                    # pero maneja cualquier media que se encuentre.
                     
                     for i, media in enumerate(media_list):
                         # Obtener la extensión original si es posible, o usar 'file'
@@ -165,65 +157,82 @@ async def _on_new_message(event):
                         # Si hay un DNI, lo incluimos en el nombre
                         dni_part = f"_{cleaned['fields'].get('dni')}" if cleaned["fields"].get("dni") else ""
                         
-                        unique_filename = f"{timestamp_str}_{event.message.id}{dni_part}_{i}{file_ext}"
+                        # 🚨 Incluir el tipo de foto/documento en el nombre para depuración
+                        type_part = f"_{cleaned['fields'].get('photo_type')}" if cleaned['fields'].get('photo_type') else ""
+                        
+                        unique_filename = f"{timestamp_str}_{event.message.id}{dni_part}{type_part}_{i}{file_ext}"
                         
                         # Descargar el medio
                         saved_path = await client.download_media(event.message, file=os.path.join(DOWNLOAD_DIR, unique_filename))
                         filename = os.path.basename(saved_path)
-                        msg_obj["urls"].append(f"{PUBLIC_URL}/files/{filename}")
                         
-                        # Manejo especial para /dnivaz (anverso/reverso)
-                        if "DNI VIRTUAL AZUL" in raw_text:
-                            if "ANVERSO" not in raw_text.upper() and "REVERSO" not in raw_text.upper():
-                                # Intentar adivinar, si el bot no lo pone
-                                side_match = re.search(r"(ANVERSO|REVERSO)", unique_filename.upper())
-                                if side_match:
-                                    msg_obj["urls"][-1] = {"url": msg_obj["urls"][-1], "side": side_match.group(1)}
-                                else:
-                                    msg_obj["urls"][-1] = {"url": msg_obj["urls"][-1], "side": f"UNKNOWN_{i+1}"}
-                            
+                        # 🚨 Estructura de URL mejorada para facilitar el uso y la identificación
+                        url_obj = {
+                            "url": f"{PUBLIC_URL}/files/{filename}", 
+                            "type": cleaned['fields'].get('photo_type', 'file'),
+                            "text_context": raw_text.split('\n')[0].strip() # Cabecera del mensaje
+                        }
+                        msg_urls.append(url_obj)
+                        
                 except Exception as e:
-                    msg_obj["media_error"] = str(e)
-                    
+                    print(f"Error al descargar media: {e}")
+                    # El error se loguea pero el proceso continúa
+        
+        msg_obj = {
+            "chat_id": getattr(event, "chat_id", None),
+            "from_id": event.sender_id,
+            "date": event.message.date.isoformat() if getattr(event, "message", None) else datetime.utcnow().isoformat(),
+            "message": cleaned["text"],
+            "fields": cleaned["fields"],
+            "urls": msg_urls # 🚨 Usar la lista de URLs construida
+        }
+
         # 3. Intentar resolver la espera de la API
         resolved = False
         with _messages_lock:
-            # Iterar sobre las esperas activas. Solo hay una, pero por seguridad.
             keys_to_check = list(response_waiters.keys())
             for command_id in keys_to_check:
                 waiter_data = response_waiters.get(command_id)
                 if not waiter_data: continue
 
-                # Condición de resolución: El DNI en el mensaje coincide con el DNI del comando.
-                # Para comandos sin DNI (ej. /tel) se debe confiar en el orden de llegada.
                 command_dni = waiter_data.get("dni")
                 message_dni = cleaned["fields"].get("dni")
-                
-                # Para /dnivaz, es crucial obtener ambos. Usaremos un timeout corto.
-                if command_dni and command_dni == message_dni:
+                command = waiter_data["command"]
+
+                # 🚨 Lógica de acumulación para /dnif (4 fotos esperadas)
+                if command.startswith("/dnif") and command_dni and command_dni == message_dni:
                     waiter_data["messages"].append(msg_obj)
-                    
-                    # Lógica de finalización para DNI VIRTUAL AZUL (2 mensajes esperados)
-                    if len(waiter_data["messages"]) >= 2 and waiter_data["command"].startswith("/dnivaz"):
+                    if len(waiter_data["messages"]) >= 4:
                         loop.call_soon_threadsafe(waiter_data["future"].set_result, waiter_data["messages"])
-                        waiter_data["timer"].cancel() # Cancelar el timer de timeout
+                        waiter_data["timer"].cancel()
                         response_waiters.pop(command_id, None)
                         resolved = True
                         break
                         
-                    # Lógica de finalización para otros comandos (1 mensaje esperado)
-                    elif not waiter_data["command"].startswith("/dnivaz") and len(waiter_data["messages"]) >= 1:
-                        loop.call_soon_threadsafe(waiter_data["future"].set_result, waiter_data["messages"][0])
-                        waiter_data["timer"].cancel() # Cancelar el timer de timeout
+                # 🚨 Lógica de acumulación para /dnivaz (2 fotos esperadas)
+                elif command.startswith("/dnivaz") and command_dni and command_dni == message_dni:
+                    waiter_data["messages"].append(msg_obj)
+                    if len(waiter_data["messages"]) >= 2:
+                        loop.call_soon_threadsafe(waiter_data["future"].set_result, waiter_data["messages"])
+                        waiter_data["timer"].cancel()
                         response_waiters.pop(command_id, None)
                         resolved = True
                         break
                         
-                # Si no hay DNI, asumimos que el primer mensaje es la respuesta
-                elif not command_dni and not waiter_data["command"].startswith("/dnivaz"):
+                # Lógica de finalización para otros comandos (1 mensaje esperado)
+                elif not command.startswith("/dnivaz") and not command.startswith("/dnif") and command_dni and command_dni == message_dni:
                     waiter_data["messages"].append(msg_obj)
                     loop.call_soon_threadsafe(waiter_data["future"].set_result, waiter_data["messages"][0])
-                    waiter_data["timer"].cancel() # Cancelar el timer de timeout
+                    waiter_data["timer"].cancel()
+                    response_waiters.pop(command_id, None)
+                    resolved = True
+                    break
+                        
+                # Si no hay DNI (para /tel, etc.), asumimos que el primer mensaje es la respuesta
+                elif not command_dni and not command.startswith(("/dnivaz", "/dnif")):
+                    waiter_data["messages"].append(msg_obj)
+                    loop.call_soon_threadsafe(waiter_data["future"].set_result, waiter_data["messages"][0])
+                    waiter_data["timer"].cancel()
                     response_waiters.pop(command_id, None)
                     resolved = True
                     break
@@ -287,27 +296,78 @@ async def _call_api_command(command: str, timeout: int = 25):
         # Si la respuesta es un mensaje de error del bot, lo manejamos
         if isinstance(result, dict) and "Por favor, usa el formato correcto" in result.get("message", ""):
              return {"status": "error_bot_format", "message": result.get("message")}
-        
-        # Manejar el caso de /dnivaz para consolidar en un solo JSON
-        if isinstance(result, list) and command.startswith("/dnivaz"):
-            # Deberían ser 2 mensajes. Si es 1 o 0, el timeout ya lo manejó o está incompleto.
+
+        # 🚨 Manejar el caso de /dnif para consolidar en un solo JSON
+        if isinstance(result, list) and command.startswith("/dnif"):
+            expected_count = 4
+            if len(result) < expected_count:
+                return {"status": "error", "message": f"Solo se recibió {len(result)} de {expected_count} partes para /dnif. Puede haber expirado el tiempo de espera."}
+
+            final_result = result[0].copy() # Clonar el primer resultado
+            final_result["full_response"] = [] # Para el texto completo
+            
+            # 🚨 Crear un diccionario para almacenar las 4 URLs con sus tipos
+            consolidated_urls = {} 
+            
+            # Recorrer los mensajes y consolidar
+            for msg in result:
+                final_result["full_response"].append(msg["message"])
+                
+                # 🚨 Recorrer las URLs de cada mensaje
+                for url_obj in msg.get("urls", []):
+                    # Usar el tipo de foto del campo extraído como clave
+                    photo_type = msg["fields"].get("photo_type")
+                    if photo_type:
+                        # Asegurar una clave única si el bot envía duplicados (ej. 2 huellas)
+                        key = photo_type
+                        if key in consolidated_urls:
+                             key = f"{photo_type}_2" if photo_type in ["huella", "huella_2"] else f"{photo_type}_1" # Ajuste para huellas
+                             if key in consolidated_urls: key = f"{key}_dup" # Último recurso
+                        
+                        consolidated_urls[key.upper()] = url_obj["url"]
+                    else:
+                        # Si no se pudo determinar el tipo, usar un nombre genérico
+                        consolidated_urls[f"UNKNOWN_PHOTO_{len(consolidated_urls)+1}"] = url_obj["url"]
+
+                # Se espera que el primer mensaje tenga los campos (DNI, Nombres, etc.)
+                if not final_result["fields"].get("dni") and msg["fields"].get("dni"):
+                    final_result["fields"] = msg["fields"]
+
+            # 🚨 Reemplazar la lista de 'urls' con el diccionario consolidado
+            final_result["urls"] = consolidated_urls 
+            final_result["message"] = " | ".join(final_result["full_response"])
+            final_result.pop("full_response")
+            return final_result
+
+        # 🚨 Manejar el caso de /dnivaz para consolidar en un solo JSON
+        elif isinstance(result, list) and command.startswith("/dnivaz"):
             if len(result) < 2:
                 return {"status": "error", "message": f"Solo se recibió {len(result)} de 2 partes para /dnivaz. Puede haber expirado el tiempo de espera."}
 
             final_result = result[0].copy() # Clonar el primer resultado
             final_result["full_response"] = [] # Para el texto completo
-            final_result["urls"] = [] # Para las URLs consolidadas
+            
+            # 🚨 Crear un diccionario para almacenar las 2 URLs con sus tipos
+            consolidated_urls = {} 
             
             # Recorrer los mensajes y consolidar
             for msg in result:
                 final_result["full_response"].append(msg["message"])
-                final_result["urls"].extend(msg["urls"])
                 
+                # 🚨 Recorrer las URLs de cada mensaje
+                for url_obj in msg.get("urls", []):
+                    photo_type = msg["fields"].get("photo_type")
+                    if photo_type:
+                        consolidated_urls[photo_type.upper()] = url_obj["url"]
+                    else:
+                        consolidated_urls[f"UNKNOWN_DNI_VIRTUAL_{len(consolidated_urls)+1}"] = url_obj["url"]
+
                 # Se espera que el primer mensaje tenga los campos (DNI, Nombres, etc.)
-                # Pero si no los tiene, los copiamos del que los tenga.
                 if not final_result["fields"].get("dni") and msg["fields"].get("dni"):
                     final_result["fields"] = msg["fields"]
 
+            # 🚨 Reemplazar la lista de 'urls' con el diccionario consolidado
+            final_result["urls"] = consolidated_urls 
             final_result["message"] = " | ".join(final_result["full_response"])
             final_result.pop("full_response")
             return final_result
@@ -345,7 +405,7 @@ async def _ensure_connected():
             await client.get_dialogs(limit=1) 
 
         except Exception:
-            tracebox.print_exc()
+            traceback.print_exc()
         await asyncio.sleep(300) # Dormir 5 minutos
 
 asyncio.run_coroutine_threadsafe(_ensure_connected(), loop)
@@ -446,11 +506,12 @@ def get_msgs():
             "result": {"quantity": len(data), "coincidences": data},
         })
 
+# 🚨 CAMBIO CRUCIAL: Agregar as_attachment=True para forzar la descarga
 @app.route("/files/<path:filename>")
 def files(filename):
     """
-    Ruta para descargar archivos. Se añade as_attachment=True para forzar la descarga.
-    Esta es la solución del backend para la descarga automática.
+    Ruta para descargar archivos. Se añade as_attachment=True para forzar la descarga 
+    en lugar de visualizar el archivo, lo que es ideal para appcreator24.
     """
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
 
@@ -461,11 +522,11 @@ def files(filename):
 # --- 1. Handlers para comandos basados en DNI (8 dígitos) o 1 parámetro simple ---
 
 @app.route("/dni", methods=["GET"])
-@app.route("/dnif", methods=["GET"])
+@app.route("/dnif", methods=["GET"]) # 🚨 Este es el comando que ahora espera 4 fotos
 @app.route("/dnidb", methods=["GET"])
 @app.route("/dnifdb", methods=["GET"])
 @app.route("/c4", methods=["GET"])
-@app.route("/dnivaz", methods=["GET"])
+@app.route("/dnivaz", methods=["GET"]) # 🚨 Este es el comando que ahora espera 2 fotos
 @app.route("/dnivam", methods=["GET"])
 @app.route("/dnivel", methods=["GET"])
 @app.route("/dniveln", methods=["GET"])
@@ -512,14 +573,14 @@ def api_dni_based_command():
     command_name = request.path.lstrip('/') 
     
     # Parámetro genérico. Se usa 'dni' para RENIEC, 'query' para /tel, etc.
-    if command_name in ["dni", "dnif", "dnidb", "dnifdb", "c4", "dnivaz", "dnivam", "dnivel", "dniveln", "fa", "fadb", "fb", "fbdb", "cnv", "cdef", "antpen", "antpol", "antjud"]:
+    dni_required_commands = ["dni", "dnif", "dnidb", "dnifdb", "c4", "dnivaz", "dnivam", "dnivel", "dniveln", "fa", "fadb", "fb", "fbdb", "cnv", "cdef", "antpen", "antpol", "antjud"]
+    
+    if command_name in dni_required_commands:
         param = request.args.get("dni")
         if not param or not param.isdigit() or len(param) != 8:
             return jsonify({"status": "error", "message": f"Parámetro 'dni' es requerido y debe ser un número de 8 dígitos para /{command_name}."}), 400
     elif command_name in ["tel", "telp", "cor", "antpenv", "dend", "dence", "denpas", "nmv", "cedula"]:
         param = request.args.get("query")
-        # En /dence y /denpas el bot espera un documento, si no se pasa, puede fallar el comando.
-        # Asumiremos que 'query' es el parámetro para todos ellos.
         if not param and command_name not in ["osiptel", "claro", "entel", "seeker", "bdir", "pasaporte"]:
             return jsonify({"status": "error", "message": f"Parámetro 'query' es requerido para /{command_name}."}), 400
     elif command_name in ["ce"]:
@@ -537,8 +598,8 @@ def api_dni_based_command():
     
     # Ejecutar comando
     try:
-        # Aumentar el timeout para /dnivaz y /dnif (más tráfico, más tiempo de descarga)
-        timeout = 30 if command_name in ["dnivaz", "dnif"] else 25
+        # 🚨 Aumentar el timeout para /dnivaz y /dnif (más tráfico, más tiempo de descarga, más mensajes)
+        timeout = 40 if command_name in ["dnivaz", "dnif"] else 25
         result = run_coro(_call_api_command(command, timeout=timeout))
         
         if result.get("status", "").startswith("error"):
@@ -616,3 +677,4 @@ if __name__ == "__main__":
         pass
     print(f"🚀 App corriendo en http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
+
