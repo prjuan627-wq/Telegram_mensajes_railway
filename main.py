@@ -400,29 +400,45 @@ async def _call_api_command(command: str, timeout: int = 25):
             if isinstance(result, dict) and "Por favor, usa el formato correcto" in result.get("message", ""):
                  return {"status": "error_bot_format", "message": result.get("message"), "bot": current_bot_id}
 
+            # 🚨 MODIFICACIÓN CRUCIAL AQUÍ: Asegurar que el resultado SIEMPRE sea una lista para la consolidación
+            # Si el bot principal solo devuelve un mensaje, Telethon lo acumula en 'messages'
+            # y en '_on_timeout' se devuelve como una lista de 1 elemento.
+            
+            # Lo que pudo haber pasado es que si el bot principal respondía muy rápido, el 'future' 
+            # se resolvía antes de tiempo con el primer mensaje, o el timeout lo devolvía como lista.
+            # La clave es tratar 'result' SIEMPRE como una lista de mensajes.
+
+            list_of_messages = result if isinstance(result, list) else [result]
+            
             # 🚨 Lógica de Consolidación de Respuestas (Si es una LISTA, la consolidamos)
-            if isinstance(result, list) and len(result) > 0:
+            if isinstance(list_of_messages, list) and len(list_of_messages) > 0:
                 
                 # Usamos el primer mensaje como base para la respuesta final
-                final_result = result[0].copy() 
+                final_result = list_of_messages[0].copy() 
                 
                 # Lista de mensajes de texto completos (limpios)
-                final_result["full_messages"] = [msg["message"] for msg in result] 
+                final_result["full_messages"] = [msg["message"] for msg in list_of_messages] 
                 
                 # Consolidar todas las URLs
                 consolidated_urls = {} 
                 url_counter = 1
                 
-                for msg in result:
+                for msg in list_of_messages:
                     for url_obj in msg.get("urls", []):
                         # Intentar usar el tipo de foto/documento como clave
                         key_base = msg["fields"].get("photo_type") or "FILE"
                         key = key_base.upper()
                         
                         # Si la clave ya existe (como en /dnif con dos huellas), la numeramos
-                        while key in consolidated_urls:
+                        # Solo numeramos si la clave es la misma y la base es algo específico (no solo FILE)
+                        while key in consolidated_urls and key_base.upper() != "FILE":
                             url_counter += 1
                             key = f"{key_base.upper()}_{url_counter}"
+                        
+                        # Si la clave es FILE, siempre la numeramos si ya existe
+                        if key_base.upper() == "FILE" and key in consolidated_urls:
+                             url_counter += 1
+                             key = f"FILE_{url_counter}"
 
                         consolidated_urls[key] = url_obj["url"]
 
@@ -437,7 +453,7 @@ async def _call_api_command(command: str, timeout: int = 25):
                 final_result.pop("full_messages")
                 
                 # Añadir la cantidad de partes recibidas
-                final_result["parts_received"] = len(result)
+                final_result["parts_received"] = len(list_of_messages)
                 final_result["bot"] = current_bot_id
                 
                 # La respuesta final de una consulta con 1 o más mensajes es la lista consolidada
@@ -445,8 +461,13 @@ async def _call_api_command(command: str, timeout: int = 25):
                 
             # Para todos los demás comandos (que solo devuelven un dict, incluyendo los errores), el resultado es único
             else: 
-                result["bot"] = current_bot_id
-                return result
+                # Si list_of_messages está vacío o no es lista (lo cual no debería pasar aquí), devolvemos el error original si lo hay.
+                if isinstance(result, dict) and result.get("status"):
+                    result["bot"] = current_bot_id
+                    return result
+                
+                # Si no hay mensajes, y no es un dict de error, devolvemos un error genérico
+                return {"status": "error", "message": f"Respuesta vacía o inesperada del bot {current_bot_id}.", "bot": current_bot_id}
             
         except Exception as e:
             # Si hay un error de Telethon/conexión.
