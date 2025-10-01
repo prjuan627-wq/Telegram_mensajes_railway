@@ -252,7 +252,7 @@ async def _on_new_message(event):
 
                 # Lógica para resolver la espera si los DNI coinciden O no hay DNI y el bot respondió.
                 dni_match = command_dni and command_dni == message_dni
-                no_dni_command = not command_dni and not command.startswith(("/dnivaz", "/dnif"))
+                no_dni_command = not command_dni and not command.startswith(("/dnif", "/dnivaz"))
 
                 if dni_match or no_dni_command:
                     
@@ -688,12 +688,15 @@ def files(filename):
 @app.route("/rqh", methods=["GET"]) # 🚨 REQUISITORIAS HISTORICAS (NUEVO)
 @app.route("/antpenv", methods=["GET"]) # ANTECEDENTES PENALES VERIFICADOR
 @app.route("/dend", methods=["GET"]) # DENUNCIAS POLICIALES (DNI)
-@app.route("/dence", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (CE) (NUEVO)
-@app.route("/denpas", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (PASAPORTE) (NUEVO)
-@app.route("/denci", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (CEDULA) (NUEVO)
-@app.route("/denp", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (PLACA) (NUEVO)
-@app.route("/denar", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (ARMAMENTO) (NUEVO)
-@app.route("/dencl", methods=["GET"]) # 🚨 DENUNCIAS POLICIALES (CLAVE) (NUEVO)
+@app.route("/dence", methods=["GET"]) # DENUNCIAS POLICIALES (CE) (AGREGADO)
+@app.route("/denpas", methods=["GET"]) # DENUNCIAS POLICIALES (PASAPORTE) (AGREGADO)
+@app.route("/denci", methods=["GET"]) # DENUNCIAS POLICIALES (CEDULA) (AGREGADO)
+@app.route("/denp", methods=["GET"]) # DENUNCIAS POLICIALES (PLACA) (AGREGADO)
+@app.route("/denar", methods=["GET"]) # DENUNCIAS POLICIALES (ARMAMENTO) (AGREGADO)
+@app.route("/dencl", methods=["GET"]) # DENUNCIAS POLICIALES (CLAVE) (AGREGADO)
+@app.route("/agv", methods=["GET"]) # ÁRBOL GENEALÓGICO VISUAL (AGREGADO)
+@app.route("/agvp", methods=["GET"]) # ÁRBOL GENEALÓGICO VISUAL PROFESIONAL (AGREGADO)
+@app.route("/cedula", methods=["GET"]) # VENEZOLANOS CEDULA (AGREGADO)
 def api_dni_based_command():
     """
     Maneja comandos que solo requieren un DNI o un parámetro simple.
@@ -707,13 +710,14 @@ def api_dni_based_command():
         "dni", "dnif", "dnidb", "dnifdb", "c4", "dnivaz", "dnivam", "dnivel", "dniveln", 
         "fa", "fadb", "fb", "fbdb", "cnv", "cdef", "antpen", "antpol", "antjud", 
         "actancc", "actamcc", "actadcc", "tra", "sue", "cla", "sune", "cun", "colp", 
-        "mine", "afp", "antpenv", "dend", "meta", "fis", "det", "rqh" # Agregados al grupo de DNI
+        "mine", "afp", "antpenv", "dend", "meta", "fis", "det", "rqh", "agv", "agvp" # Agregados al grupo de DNI
     ]
     
     # Comandos que esperan un parámetro de consulta genérico (query)
     query_required_commands = [
         "tel", "telp", "cor", "nmv", "tremp", # Otros
         "dence", "denpas", "denci", "denp", "denar", "dencl", # Denuncias por otros docs/placa/clave
+        "cedula", # Venezolanos Cédula
         "fisdet" # Aunque no lo pediste, el formato de /fisdet es complejo, pero lo manejaremos genérico
     ]
     
@@ -728,19 +732,36 @@ def api_dni_based_command():
             return jsonify({"status": "error", "message": f"Parámetro 'dni' es requerido y debe ser un número de 8 dígitos para /{command_name}."}), 400
     
     elif command_name in query_required_commands:
-        param = request.args.get("query")
+        # Usamos 'query' como nombre de parámetro genérico para todos estos.
+        # Si el comando es /cedula, el usuario probablemente enviará 'cedula' en el URL.
+        # Verificamos si es un parámetro específico de la ruta o usamos 'query'.
+        if command_name == "cedula":
+            param = request.args.get("cedula")
+        elif command_name == "dence":
+            param = request.args.get("carnet_extranjeria") or request.args.get("query")
+        elif command_name == "denpas":
+            param = request.args.get("pasaporte") or request.args.get("query")
+        elif command_name == "denci":
+            param = request.args.get("cedula_identidad") or request.args.get("query")
+        elif command_name == "denp":
+            param = request.args.get("placa") or request.args.get("query")
+        elif command_name == "denar":
+            param = request.args.get("serie_armamento") or request.args.get("query")
+        elif command_name == "dencl":
+            param = request.args.get("clave_denuncia") or request.args.get("query")
+        else:
+             param = request.args.get("query")
+             
         if not param:
-            return jsonify({"status": "error", "message": f"Parámetro 'query' es requerido para /{command_name}."}), 400
+            return jsonify({"status": "error", "message": f"Parámetro de consulta es requerido para /{command_name}."}), 400
     
-    elif command_name in ["ce"]:
-        param = request.args.get("ce")
-        if not param:
-            return jsonify({"status": "error", "message": f"Parámetro 'ce' es requerido para /{command_name}."}), 400
-            
     elif command_name in optional_commands:
         param_dni = request.args.get("dni")
         param_query = request.args.get("query")
-        param = param_dni or param_query or ""
+        # Si el comando es /pasaporte, busca el parámetro 'pasaporte'
+        param_pasaporte = request.args.get("pasaporte") if command_name == "pasaporte" else None
+        
+        param = param_dni or param_query or param_pasaporte or ""
         
     else:
         # En caso de que se añadan nuevos comandos no cubiertos por DNI o Query
@@ -836,3 +857,4 @@ if __name__ == "__main__":
         pass
     print(f"🚀 App corriendo en http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
+
