@@ -257,14 +257,6 @@ async def _on_new_message(event):
                     # 🚨 NO resolvemos el future aquí. El timer de timeout (TIMEOUT_FAILOVER o TIMEOUT_TOTAL)
                     # será el que dispare el resultado, enviando la LISTA COMPLETA de mensajes.
                     
-                    # 🚨 CRUCIAL: Reiniciar el timer si llega un mensaje para dar tiempo al siguiente.
-                    # El timer debe ser del TIMEOUT_TOTAL, no del failover.
-                    # El failover ya ocurrió si estamos en el bot de respaldo.
-                    
-                    # 🚨 Lógica corregida: El timer del Future ya se estableció en _call_api_command.
-                    # No necesitamos reiniciarlo aquí. Simplemente dejamos que acumule mensajes
-                    # hasta que el tiempo preestablecido se agote y resuelva.
-                    
                     # El único caso de resolución forzada que dejamos es el de error de formato del bot
                     if "Por favor, usa el formato correcto" in msg_obj["message"]:
                         loop.call_soon_threadsafe(waiter_data["future"].set_result, msg_obj)
@@ -710,15 +702,16 @@ def api_dni_based_command():
         "dni", "dnif", "dnidb", "dnifdb", "c4", "dnivaz", "dnivam", "dnivel", "dniveln", 
         "fa", "fadb", "fb", "fbdb", "cnv", "cdef", "antpen", "antpol", "antjud", 
         "actancc", "actamcc", "actadcc", "tra", "sue", "cla", "sune", "cun", "colp", 
-        "mine", "afp", "antpenv", "dend", "meta", "fis", "det", "rqh", "agv", "agvp" # Agregados al grupo de DNI
+        "mine", "afp", "antpenv", "dend", "meta", "fis", "det", "rqh", "agv", "agvp"
     ]
     
     # Comandos que esperan un parámetro de consulta genérico (query)
     query_required_commands = [
-        "tel", "telp", "cor", "nmv", "tremp", # Otros
-        "dence", "denpas", "denci", "denp", "denar", "dencl", # Denuncias por otros docs/placa/clave
+        "tel", "telp", "cor", "nmv", "tremp", 
+        # 🚨 LOS 7 NUEVOS COMANDOS (excepto /rqh y /fisdet, que ya están arriba o se manejan especial)
+        "fisdet", # DETALLADO
+        "dence", "denpas", "denci", "denp", "denar", "dencl", 
         "cedula", # Venezolanos Cédula
-        "fisdet" # Se espera DNI y detalle, pero para el bot solo se necesita la consulta.
     ]
     
     # Comandos que toman DNI o query, o pueden ir sin nada (ej: /osiptel sin query da info general)
@@ -734,9 +727,22 @@ def api_dni_based_command():
     elif command_name in query_required_commands:
         
         param_value = None
-        # Intenta obtener el parámetro con un nombre específico (para claridad)
-        if command_name == "cedula":
-            param_value = request.args.get("cedula")
+        
+        # --- Lógica específica para los 7 comandos ---
+        if command_name == "fisdet":
+            # Formato: /fisdet <caso|distritojudicial>
+            # Buscamos 'dni' (o caso/distritojudicial) o 'query'
+            param_value = request.args.get("caso") or request.args.get("distritojudicial") or request.args.get("query")
+            
+            # Si el usuario usa el formato 'dni|detalle' (aunque el nuevo formato pide caso/distrito)
+            if not param_value:
+                dni_val = request.args.get("dni")
+                det_val = request.args.get("detalle")
+                if dni_val and det_val:
+                    param_value = f"{dni_val}|{det_val}"
+                elif dni_val:
+                    param_value = dni_val # Usar solo DNI si detalle no está
+        
         elif command_name == "dence":
             param_value = request.args.get("carnet_extranjeria")
         elif command_name == "denpas":
@@ -749,16 +755,12 @@ def api_dni_based_command():
             param_value = request.args.get("serie_armamento")
         elif command_name == "dencl":
             param_value = request.args.get("clave_denuncia")
-        elif command_name == "fisdet":
-            # Para /fisdet (ej: /fisdet?dni=12345678&detalle=2)
-            dni_val = request.args.get("dni")
-            det_val = request.args.get("detalle")
-            if dni_val and det_val:
-                param_value = f"{dni_val}|{det_val}"
-            elif dni_val:
-                param_value = dni_val
+            
+        # --- Lógica para otros comandos de query ---
+        elif command_name == "cedula":
+            param_value = request.args.get("cedula")
         
-        # Si no se encontró el parámetro específico, usamos 'query'
+        # Si no se encontró el parámetro específico, usamos 'query' (o dni de fallback)
         param = param_value or request.args.get("dni") or request.args.get("query")
              
         if not param:
@@ -869,4 +871,3 @@ if __name__ == "__main__":
         pass
     print(f"🚀 App corriendo en http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
-
