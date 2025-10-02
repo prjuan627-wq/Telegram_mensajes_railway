@@ -65,6 +65,7 @@ def is_bot_blocked(bot_id: str) -> bool:
 def record_bot_failure(bot_id: str):
     """Registra la hora actual como la última hora de fallo del bot."""
     print(f"🚨 Bot {bot_id} ha fallado por timeout y será BLOQUEADO por {BOT_FAIL_TIMEOUT_HOURS} horas.")
+    # Usamos datetime.now() para la hora local/del servidor
     bot_fail_tracker[bot_id] = datetime.now()
 
 # --- Aplicación Flask ---
@@ -240,6 +241,8 @@ async def _on_new_message(event):
 
         # 3. Intentar resolver la espera de la API
         resolved = False
+        command_id_resolved = None
+        
         with _messages_lock:
             keys_to_check = list(response_waiters.keys())
             for command_id in keys_to_check:
@@ -252,11 +255,16 @@ async def _on_new_message(event):
 
                 # Lógica para resolver la espera si los DNI coinciden O no hay DNI y el bot respondió.
                 dni_match = command_dni and command_dni == message_dni
+                # Usar el ID del bot que envió el comando para asegurar que la respuesta viene del bot que estamos esperando
+                # Nota: Si se salta del bot principal al de respaldo, ambos pueden enviar mensajes, pero solo el último enviado tendrá un waiter activo
+                bot_id_match = event.sender_id == _on_new_message.bot_ids.get(waiter_data["sent_to_bot"])
+                
+                # Para comandos sin DNI (ej: /tel, /cor), solo importa que sea el bot correcto y que no estemos esperando DNI
                 no_dni_command = not command_dni and not command.startswith(("/dnif", "/dnivaz"))
 
-                if dni_match or no_dni_command:
+                if (dni_match or no_dni_command) and bot_id_match:
                     
-                    # 🚨 1. Lógica de acumulación simple: Agregar el mensaje y reiniciar el timer
+                    # 🚨 1. Lógica de acumulación simple: Agregar el mensaje
                     waiter_data["messages"].append(msg_obj)
                     
                     # 🚨 2. Lógica de resolución forzada para comandos de cantidad fija de fotos
@@ -265,7 +273,7 @@ async def _on_new_message(event):
                         # 4 fotos esperadas para /dnif
                         loop.call_soon_threadsafe(waiter_data["future"].set_result, waiter_data["messages"])
                         waiter_data["timer"].cancel()
-                        response_waiters.pop(command_id, None)
+                        command_id_resolved = command_id
                         resolved = True
                         break
                             
@@ -273,19 +281,35 @@ async def _on_new_message(event):
                         # 2 fotos esperadas para /dnivaz
                         loop.call_soon_threadsafe(waiter_data["future"].set_result, waiter_data["messages"])
                         waiter_data["timer"].cancel()
-                        response_waiters.pop(command_id, None)
+                        command_id_resolved = command_id
                         resolved = True
                         break
                         
-                    # 🚨 3. Para TODOS los demás comandos (incluidos /meta, /sbs, etc.):
-                    # No resolvemos aquí. El timer de timeout (40s) será el que dispare el resultado
-                    # enviando la LISTA COMPLETA de mensajes acumulados hasta ese momento.
-                    # Sólo reiniciamos el timer para asegurar que si llega un mensaje, el timeout
-                    # se reinicie para esperar el siguiente. (¡No se necesita reiniciar el timer del future,
-                    # solo esperar el tiempo total que lo resuelve en _on_timeout!)
+                    # 🚨 3. Lógica de no reintentar: Si el bot responde, NO se debe intentar el otro.
+                    # El futuro está activo. Si el mensaje contiene un texto de "no encontrado" o "error de formato",
+                    # lo resolvemos inmediatamente. Esto evita que el timeout del bot principal (25s) 
+                    # nos fuerce a ir al de respaldo si ya obtuvimos una respuesta del bot.
                     
-                    # 🚨 IMPORTANTE: NO TOCAR EL TIMER DEL FUTURE AQUÍ.
-                    # Simplemente permitimos que el mensaje se acumule y el timer de 40s resuelva.
+                    # Palabras clave que indican una respuesta final (aunque sea negativa)
+                    negative_keywords = ["no se encontró", "por favor, usa el formato correcto", "error de formato", "dni es incorrecto"]
+                    
+                    if any(kw in cleaned["text"].lower() for kw in negative_keywords):
+                        # Respuesta final recibida. Resuelve inmediatamente.
+                        loop.call_soon_threadsafe(waiter_data["future"].set_result, waiter_data["messages"])
+                        waiter_data["timer"].cancel()
+                        command_id_resolved = command_id
+                        resolved = True
+                        break
+
+                    # 🚨 4. Para TODOS los demás comandos (incluidos /meta, /sbs, etc.):
+                    # Acumulamos el mensaje y dejamos que el TIMEOUT_TOTAL de 40s resuelva el future
+                    # con la lista completa de mensajes acumulados hasta ese momento.
+                    # El timer del future sigue activo y será el que cierre la espera.
+        
+        # Eliminamos el waiter si se resolvió
+        if command_id_resolved:
+            with _messages_lock:
+                 response_waiters.pop(command_id_resolved, None)
 
         # 4. Agregar a la cola de historial si no se usó para una respuesta específica
         if not resolved:
@@ -304,7 +328,8 @@ async def _call_api_command(command: str, timeout: int = 25):
     if not await client.is_user_authorized():
         raise Exception("Cliente no autorizado. Por favor, inicie sesión.")
 
-    command_id = time.time() # ID temporal
+    # Generamos un ID de comando único (usando tiempo y un hash simple del comando)
+    command_id = hash(f"{time.time()}-{command}") 
     
     # Extraer DNI del comando si existe
     dni_match = re.search(r"/\w+\s+(\d{8})", command)
@@ -338,9 +363,9 @@ async def _call_api_command(command: str, timeout: int = 25):
             "sent_to_bot": current_bot_id
         }
         
-        # 🚨 Usamos el TIMEOUT_TOTAL para todos los comandos, para dar tiempo a recibir
-        # los múltiples mensajes. Solo el bot primario tiene un tiempo más corto
-        # para hacer el failover si falla rápido, pero el tiempo de espera para los mensajes es el total.
+        # El tiempo de espera que usaremos para el timer del Future
+        # Bot principal: usamos TIMEOUT_PRIMARY_BOT_FAILOVER (25s) para el failover.
+        # Bot de respaldo: usamos TIMEOUT_TOTAL (40s) para asegurar la espera completa.
         current_timeout = TIMEOUT_PRIMARY_BOT_FAILOVER if attempt == 1 else TIMEOUT_TOTAL
         
         # Función de timeout para el Future
@@ -349,7 +374,7 @@ async def _call_api_command(command: str, timeout: int = 25):
                 waiter_data = response_waiters.pop(command_id_on_timeout, None)
                 if waiter_data and not waiter_data["future"].done():
                     
-                    # 🚨 CRUCIAL: Si llegaron mensajes, devolverlos como resultado. Si no, es un timeout/fallo
+                    # 🚨 CRUCIAL: Si llegaron mensajes, devolverlos como resultado. Si no, es un timeout/fallo.
                     if waiter_data["messages"]:
                         # Devolver la lista de mensajes acumulados (EXITO PARCIAL/TOTAL)
                         loop.call_soon_threadsafe(
@@ -357,13 +382,20 @@ async def _call_api_command(command: str, timeout: int = 25):
                             waiter_data["messages"]
                         )
                     else:
-                        # No llegó NINGÚN mensaje. Es un fallo real.
-                        # 1. Registrar la falla del bot
-                        record_bot_failure(bot_id_on_timeout)
+                        # No llegó NINGÚN mensaje (Fallo total).
+                        
+                        # 1. Registrar la falla del bot SOLO si es el bot principal (25s) O si es el de respaldo (40s).
+                        # Si es el intento 1 (25s) y falló, se registra la falla para el bloqueo de 6h.
+                        # Si es el intento 2 (40s) y falló, también se registra la falla.
+                        is_final_fail = (attempt == 1 and current_timeout == TIMEOUT_PRIMARY_BOT_FAILOVER) or (attempt == 2 and current_timeout == TIMEOUT_TOTAL)
+                        
+                        if is_final_fail:
+                            record_bot_failure(bot_id_on_timeout)
+
                         # 2. Resolver el future con un error de timeout
                         loop.call_soon_threadsafe(
                             waiter_data["future"].set_result, 
-                            {"status": "error_timeout", "message": f"Tiempo de espera de respuesta agotado ({current_timeout}s). No se recibió NINGÚN mensaje para el comando: {command}.", "bot": bot_id_on_timeout, "fail_recorded": True}
+                            {"status": "error_timeout", "message": f"Tiempo de espera de respuesta agotado ({current_timeout}s). No se recibió NINGÚN mensaje para el comando: {command}.", "bot": bot_id_on_timeout, "fail_recorded": is_final_fail}
                         )
 
         # Establecer el timer de timeout en el loop de Telethon
@@ -382,92 +414,68 @@ async def _call_api_command(command: str, timeout: int = 25):
             # 5. Esperar la respuesta (que será una lista de mensajes o un dict de error)
             result = await future
             
-            # 6. Si el resultado es un timeout, pasamos al siguiente bot.
+            # 6. Lógica de Fallo/Respaldo según el resultado
+
+            # Si el resultado es un timeout y es el bot principal, pasamos al de respaldo.
             if isinstance(result, dict) and result.get("status") == "error_timeout" and attempt == 1:
-                print(f"⌛ Timeout de {LEDERDATA_BOT_ID}. Intentando con {LEDERDATA_BACKUP_BOT_ID}.")
+                print(f"⌛ Timeout de {LEDERDATA_BOT_ID} (no hubo respuesta). Intentando con {LEDERDATA_BACKUP_BOT_ID}.")
                 continue # Pasa al siguiente intento/bot
-            elif isinstance(result, dict) and result.get("status") == "error_timeout" and attempt == 2:
+            
+            # Si el bot de respaldo falló también con timeout, o si el bot principal respondió algo (lista de mensajes), o un error.
+            if isinstance(result, dict) and result.get("status") == "error_timeout" and attempt == 2:
                 # El bot de respaldo falló también. Retornar el error final.
                 return result 
             
-            # Si se llega aquí, el comando fue exitoso con el bot actual (result es una lista de mensajes o un dict de error de formato)
+            # Si se llega aquí, el comando fue exitoso con el bot actual (result es una lista de mensajes)
             
-            # Si la respuesta es un mensaje de error del bot (que puede ser el primer elemento de la lista), lo manejamos
-            if isinstance(result, list) and "Por favor, usa el formato correcto" in result[0].get("message", ""):
-                 return {"status": "error_bot_format", "message": result[0].get("message"), "bot": current_bot_id}
+            # 🚨 Tratamos 'result' como la lista de mensajes acumulados
+            list_of_messages = result if isinstance(result, list) else ([result] if isinstance(result, dict) else [])
             
-            # Si la respuesta es un mensaje de error del bot (dict, si solo llegó uno)
-            if isinstance(result, dict) and "Por favor, usa el formato correcto" in result.get("message", ""):
-                 return {"status": "error_bot_format", "message": result.get("message"), "bot": current_bot_id}
-
-            # 🚨 MODIFICACIÓN CRUCIAL AQUÍ: Asegurar que el resultado SIEMPRE sea una lista para la consolidación
-            # Si el bot principal solo devuelve un mensaje, Telethon lo acumula en 'messages'
-            # y en '_on_timeout' se devuelve como una lista de 1 elemento.
-            
-            # Lo que pudo haber pasado es que si el bot principal respondía muy rápido, el 'future' 
-            # se resolvía antes de tiempo con el primer mensaje, o el timeout lo devolvía como lista.
-            # La clave es tratar 'result' SIEMPRE como una lista de mensajes.
-
-            list_of_messages = result if isinstance(result, list) else [result]
-            
-            # 🚨 Lógica de Consolidación de Respuestas (Si es una LISTA, la consolidamos)
-            if isinstance(list_of_messages, list) and len(list_of_messages) > 0:
-                
-                # Usamos el primer mensaje como base para la respuesta final
-                final_result = list_of_messages[0].copy() 
-                
-                # Lista de mensajes de texto completos (limpios)
-                final_result["full_messages"] = [msg["message"] for msg in list_of_messages] 
-                
-                # Consolidar todas las URLs
-                consolidated_urls = {} 
-                url_counter = 1
-                
-                for msg in list_of_messages:
-                    for url_obj in msg.get("urls", []):
-                        # Intentar usar el tipo de foto/documento como clave
-                        key_base = msg["fields"].get("photo_type") or "FILE"
-                        key = key_base.upper()
-                        
-                        # Si la clave ya existe (como en /dnif con dos huellas), la numeramos
-                        # Solo numeramos si la clave es la misma y la base es algo específico (no solo FILE)
-                        while key in consolidated_urls and key_base.upper() != "FILE":
-                            url_counter += 1
-                            key = f"{key_base.upper()}_{url_counter}"
-                        
-                        # Si la clave es FILE, siempre la numeramos si ya existe
-                        if key_base.upper() == "FILE" and key in consolidated_urls:
-                             url_counter += 1
-                             key = f"FILE_{url_counter}"
-
-                        consolidated_urls[key] = url_obj["url"]
-
-                    # Asegurarnos de que los fields (como DNI) se capturen si no vinieron en el primer mensaje
-                    if not final_result["fields"].get("dni") and msg["fields"].get("dni"):
-                        final_result["fields"] = msg["fields"]
-                        
-                final_result["urls"] = consolidated_urls 
-                
-                # Unimos todos los mensajes de texto para la clave principal 'message'
-                final_result["message"] = "\n---\n".join(final_result["full_messages"])
-                final_result.pop("full_messages")
-                
-                # Añadir la cantidad de partes recibidas
-                final_result["parts_received"] = len(list_of_messages)
-                final_result["bot"] = current_bot_id
-                
-                # La respuesta final de una consulta con 1 o más mensajes es la lista consolidada
-                return final_result
-                
-            # Para todos los demás comandos (que solo devuelven un dict, incluyendo los errores), el resultado es único
-            else: 
-                # Si list_of_messages está vacío o no es lista (lo cual no debería pasar aquí), devolvemos el error original si lo hay.
-                if isinstance(result, dict) and result.get("status"):
-                    result["bot"] = current_bot_id
-                    return result
-                
-                # Si no hay mensajes, y no es un dict de error, devolvemos un error genérico
+            if not list_of_messages:
+                # Esto es un error inesperado, pero lo manejamos
                 return {"status": "error", "message": f"Respuesta vacía o inesperada del bot {current_bot_id}.", "bot": current_bot_id}
+
+            # 🚨 Lógica de Consolidación de Respuestas
+            
+            # Usamos el primer mensaje como base para la respuesta final
+            final_result = list_of_messages[0].copy() 
+            
+            # Lista de mensajes de texto completos (limpios)
+            final_result["full_messages"] = [msg["message"] for msg in list_of_messages] 
+            
+            # Consolidar todas las URLs
+            consolidated_urls = {} 
+            url_counter = 1
+            
+            for msg in list_of_messages:
+                for url_obj in msg.get("urls", []):
+                    # Intentar usar el tipo de foto/documento como clave (rostro, huella, firma, etc.)
+                    key_base = msg["fields"].get("photo_type") or "FILE"
+                    key = key_base.upper()
+                    
+                    # Si la clave ya existe, la numeramos
+                    if key in consolidated_urls:
+                        url_counter += 1
+                        key = f"{key_base.upper()}_{url_counter}"
+                    
+                    consolidated_urls[key] = url_obj["url"]
+
+                # Asegurarnos de que los fields (como DNI) se capturen si no vinieron en el primer mensaje
+                if not final_result["fields"].get("dni") and msg["fields"].get("dni"):
+                    final_result["fields"] = msg["fields"]
+                    
+            final_result["urls"] = consolidated_urls 
+            
+            # Unimos todos los mensajes de texto para la clave principal 'message'
+            final_result["message"] = "\n---\n".join(final_result["full_messages"])
+            final_result.pop("full_messages")
+            
+            # Añadir la cantidad de partes recibidas
+            final_result["parts_received"] = len(list_of_messages)
+            final_result["bot"] = current_bot_id
+            
+            # La respuesta final consolidada
+            return final_result
             
         except Exception as e:
             # Si hay un error de Telethon/conexión.
@@ -549,9 +557,13 @@ def status():
     bot_status = {}
     for bot_id in ALL_BOT_IDS:
         is_blocked = is_bot_blocked(bot_id)
+        # Aseguramos que el tiempo de falla se muestre correctamente
+        last_fail_dt = bot_fail_tracker.get(bot_id)
+        last_fail_str = last_fail_dt.isoformat() if last_fail_dt else None
+        
         bot_status[bot_id] = {
             "blocked": is_blocked,
-            "last_fail": bot_fail_tracker.get(bot_id).isoformat() if bot_fail_tracker.get(bot_id) else None
+            "last_fail": last_fail_str
         }
 
     return jsonify({
@@ -715,7 +727,7 @@ def api_dni_based_command():
     
     # Comandos que esperan un parámetro de consulta genérico (query)
     query_required_commands = [
-        "tel", "telp", "cor", "nmv", "tremp", # Otros
+        "tremp", # Otros
         "dence", "denpas", "denci", "denp", "denar", "dencl", # Denuncias por otros docs/placa/clave
         "cedula", # Venezolanos Cédula
         "fisdet" # Aunque no lo pediste, el formato de /fisdet es complejo, pero lo manejaremos genérico
@@ -749,6 +761,9 @@ def api_dni_based_command():
             param = request.args.get("serie_armamento") or request.args.get("query")
         elif command_name == "dencl":
             param = request.args.get("clave_denuncia") or request.args.get("query")
+        # El comando /fisdet requiere DNI, pero se usa como /fisdet 10001088. Se maneja como "query"
+        elif command_name == "fisdet":
+            param = request.args.get("dni") or request.args.get("query")
         else:
              param = request.args.get("query")
              
