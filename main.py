@@ -13,6 +13,7 @@ from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
+from telethon.errors.rpcerrorlist import UserBlockedError # Importar el error específico
 
 # --- Configuración ---
 
@@ -44,7 +45,7 @@ TIMEOUT_TOTAL = 40
 
 # --- Manejo de Fallos por Bot (Implementación de tu lógica) ---
 
-# Diccionario para rastrear los fallos por timeout: {bot_id: datetime_of_failure}
+# Diccionario para rastrear los fallos por timeout/bloqueo: {bot_id: datetime_of_failure}
 bot_fail_tracker = {}
 BOT_FAIL_TIMEOUT_HOURS = 6 # Tiempo de bloqueo de 6 horas
 
@@ -54,19 +55,26 @@ def is_bot_blocked(bot_id: str) -> bool:
     if not last_fail_time:
         return False
 
-    six_hours_ago = datetime.now() - timedelta(hours=BOT_FAIL_TIMEOUT_HOURS)
+    # Usamos la hora actual para la verificación
+    now = datetime.now()
+    six_hours_ago = now - timedelta(hours=BOT_FAIL_TIMEOUT_HOURS)
 
     # Si la última falla fue más reciente que 'six_hours_ago', está bloqueado
     if last_fail_time > six_hours_ago:
+        # Imprimir el tiempo restante para depuración
+        time_left = last_fail_time + timedelta(hours=BOT_FAIL_TIMEOUT_HOURS) - now
+        print(f"🚫 Bot {bot_id} bloqueado. Restan: {time_left}")
         return True
     
     # Si ya pasó el tiempo, eliminamos el registro y permitimos el intento
+    print(f"✅ Bot {bot_id} ha cumplido su tiempo de bloqueo. Desbloqueado.")
     bot_fail_tracker.pop(bot_id, None)
     return False
 
 def record_bot_failure(bot_id: str):
     """Registra la hora actual como la última hora de fallo del bot."""
-    print(f"🚨 Bot {bot_id} ha fallado por timeout y será BLOQUEADO por {BOT_FAIL_TIMEOUT_HOURS} horas.")
+    print(f"🚨 Bot {bot_id} ha fallado y será BLOQUEADO por {BOT_FAIL_TIMEOUT_HOURS} horas.")
+    # Usamos datetime.now() para que coincida con la verificación en is_bot_blocked
     bot_fail_tracker[bot_id] = datetime.now()
 
 # --- Aplicación Flask ---
@@ -483,13 +491,42 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
                 # Esto debería ser cubierto por el error_timeout, pero por si acaso.
                 return {"status": "error", "message": f"Respuesta vacía o inesperada del bot {current_bot_id}.", "bot_used": current_bot_id}
             
+        # --- CAPTURA DE ERROR CLAVE: UserBlockedError ---
+        except UserBlockedError as e:
+            error_msg = f"Error de Telethon/conexión/fallo: You blocked this user (caused by SendMessageRequest)"
+            print(f"❌ Error de BLOQUEO en {current_bot_id}: {error_msg}. Registrando fallo y pasando al siguiente bot.")
+            
+            # Registrar la falla por bloqueo inmediatamente
+            record_bot_failure(current_bot_id)
+            
+            # Limpiar el waiter y cancelar el timer ANTES de pasar al siguiente intento
+            with _messages_lock:
+                 if command_id in response_waiters:
+                    waiter_data = response_waiters.pop(command_id, None)
+                    if waiter_data and waiter_data["timer"]:
+                        waiter_data["timer"].cancel()
+                        
+            if attempt == 1:
+                continue # Pasa al bot de respaldo
+            else:
+                # Si falla el intento 2 por bloqueo, retornamos el error final.
+                return {"status": "error", "message": error_msg, "bot_used": current_bot_id}
+            
         except Exception as e:
-            # Si hay un error de Telethon/conexión.
+            # Si hay un error de Telethon/conexión GENERAL (diferente a UserBlockedError).
             error_msg = f"Error de Telethon/conexión/fallo: {str(e)}"
             if attempt == 1:
                 print(f"❌ Error en {LEDERDATA_BOT_ID}: {error_msg}. Intentando con {LEDERDATA_BACKUP_BOT_ID}.")
                 # Registrar la falla por error de conexión
                 record_bot_failure(LEDERDATA_BOT_ID)
+                
+                # Limpiar el waiter y cancelar el timer ANTES de pasar al siguiente intento
+                with _messages_lock:
+                     if command_id in response_waiters:
+                        waiter_data = response_waiters.pop(command_id, None)
+                        if waiter_data and waiter_data["timer"]:
+                            waiter_data["timer"].cancel()
+                            
                 continue
             else:
                 # Si falla el intento 2, retornamos el error final.
@@ -521,14 +558,26 @@ async def _ensure_connected():
             if not client.is_connected():
                 print("🔌 Intentando reconectar Telethon...")
                 await client.connect()
-                # Intentar obtener la entidad de ambos bots después de la reconexión
+            
+            if client.is_connected() and not await client.is_user_authorized():
+                 print("⚠️ Telethon conectado, pero no autorizado. Reintentando auth...")
+                 # Si la sesión es de StringSession, no puede re-auth si no hay 2FA/login
+                 # Pero si es un archivo de sesión, intentar start() podría ayudar.
+                 try:
+                    await client.start()
+                 except Exception:
+                     pass
+
+            # Intentar obtener la entidad de ambos bots después de la reconexión/auth
+            if await client.is_user_authorized():
                 await client.get_entity(LEDERDATA_BOT_ID) 
                 await client.get_entity(LEDERDATA_BACKUP_BOT_ID) 
-                print("✅ Reconexión exitosa.")
-            elif not await client.is_user_authorized():
-                 print("⚠️ Telethon conectado, pero no autorizado.")
-            # Un ping simple para mantener viva la conexión
-            await client.get_dialogs(limit=1) 
+                # Un ping simple para mantener viva la conexión
+                await client.get_dialogs(limit=1) 
+                print("✅ Reconexión y verificación de bots exitosa.")
+            else:
+                 print("🔴 Cliente no autorizado. Requerido /login.")
+
 
         except Exception:
             traceback.print_exc()
@@ -886,6 +935,10 @@ def api_venezolanos_nombres():
 if __name__ == "__main__":
     try:
         run_coro(client.connect())
+        # Intentar iniciar la sesión (si es persistente)
+        if not run_coro(client.is_user_authorized()):
+             run_coro(client.start())
+             
         # Esto ayuda a Telethon a resolver la entidad de ambos bots al inicio
         run_coro(client.get_entity(LEDERDATA_BOT_ID)) 
         run_coro(client.get_entity(LEDERDATA_BACKUP_BOT_ID)) 
