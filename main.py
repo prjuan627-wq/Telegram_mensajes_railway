@@ -33,6 +33,15 @@ LEDERDATA_BOT_ID = "@LEDERDATA_OFC_BOT"
 # El chat ID/nombre del bot de respaldo (NUEVO BOT)
 LEDERDATA_BACKUP_BOT_ID = "@lederdata_publico_bot"
 
+# ID/Nombre del canal de películas (Necesitas ser miembro)
+# Usando el nombre corto que se ve en el link: '+qE1c6fb3l0w2ODlh'
+MOVIE_CHANNEL_ENTITY = "c/1507924325" # Si usas el ID numérico es mejor, si no, el username o el hash
+# Usaremos el hash/ID numérico para Telethon si la sesión de usuario ya se ha unido. 
+# Si el hash es 'qE1c6fb3l0w2ODlh', en la URL de 't.me/+' se resuelve.
+# Para Telethon, se puede usar el ID numérico largo (con o sin el prefijo -100).
+MOVIE_CHANNEL_ID_FOR_TELETHON = -1001507924325 
+MOVIE_CHANNEL_NAME = "𝗘𝗹 𝗖𝗶𝗻𝗲́𝗳𝗶𝗹𝗼 𝘗𝘦𝘭𝘪𝘤𝘶𝘭𝘢𝘴 𝘊𝘰𝘮𝘱𝘭𝘦𝘵𝘢𝘴"
+
 # Lista de bots para verificar en el handler
 ALL_BOT_IDS = [LEDERDATA_BOT_ID, LEDERDATA_BACKUP_BOT_ID]
 
@@ -42,15 +51,6 @@ TIMEOUT_FAILOVER = 25
 # Tiempo de espera total para la llamada a la API. ESTE DEFINE CUANTO ESPERA POR TODOS LOS MENSAJES
 # Si el bot de respaldo se usa, tiene 40 segundos.
 TIMEOUT_TOTAL = 40 
-
-# --- Configuración Específica para la Búsqueda de Películas ---
-# El identificador del canal de películas. 
-# Si es un link de invitación con '+', debe ser el hash completo (con el '+' si aplica).
-MOVIE_CHANNEL_HASH = "+qE1c6fb3l0w2ODlh" 
-# Nombre/Alias interno para usar en mensajes de log/error
-MOVIE_CHANNEL_NAME = "Canal de Películas Privado"
-# Máximo de resultados a devolver en la búsqueda
-MAX_MOVIE_RESULTS = 10 
 
 # --- Manejo de Fallos por Bot (Implementación de tu lógica) ---
 
@@ -193,6 +193,10 @@ async def _on_new_message(event):
         if event.sender_id in _on_new_message.bot_ids.values():
             sender_is_bot = True
         
+        # OJO: Se IGNORA el canal de películas aquí para no interferir con la lógica de bots.
+        # Si quisieras monitorear el canal de películas, deberías agregarlo a una lógica SEPARADA
+        # para que no interfiera con los comandos de los bots.
+
         if not sender_is_bot:
             return # Ignorar mensajes que no sean de los bots
             
@@ -581,16 +585,9 @@ async def _ensure_connected():
             if await client.is_user_authorized():
                 await client.get_entity(LEDERDATA_BOT_ID) 
                 await client.get_entity(LEDERDATA_BACKUP_BOT_ID) 
-                
-                # Intentar obtener la entidad del canal de películas (IMPORTANTE)
-                try:
-                    await client.get_entity(MOVIE_CHANNEL_HASH)
-                except Exception as e:
-                     print(f"⚠️ Atención: No se pudo resolver la entidad del canal de películas ({MOVIE_CHANNEL_HASH}): {e}")
-                
                 # Un ping simple para mantener viva la conexión
                 await client.get_dialogs(limit=1) 
-                print("✅ Reconexión y verificación de entidades exitosa.")
+                print("✅ Reconexión y verificación de bots exitosa.")
             else:
                  print("🔴 Cliente no autorizado. Requerido /login.")
 
@@ -601,14 +598,112 @@ async def _ensure_connected():
 
 asyncio.run_coroutine_threadsafe(_ensure_connected(), loop)
 
+# --- Funciones para la NUEVA API de Películas ---
+
+async def _search_movie_in_channel(query: str, limit: int = 10):
+    """
+    Busca una película en el canal por nombre/descripción y descarga el archivo.
+    Requiere que la cuenta de Telethon sea miembro del canal.
+    """
+    if not await client.is_user_authorized():
+        return {"status": "error", "message": "Cliente no autorizado. Por favor, inicie sesión."}
+
+    try:
+        # Intenta obtener la entidad del canal (debe estar unido)
+        channel_entity = await client.get_entity(MOVIE_CHANNEL_ID_FOR_TELETHON)
+    except Exception:
+        return {"status": "error", "message": f"No se pudo acceder al canal {MOVIE_CHANNEL_NAME}. Confirma que tu sesión de Telethon está unida al canal y usa el ID correcto."}
+    
+    found_movies = []
+    
+    # Se usa client.iter_messages con 'search' para que Telegram haga la búsqueda interna
+    async for message in client.iter_messages(channel_entity, search=query, limit=limit):
+        if message.media and isinstance(message.media, MessageMediaDocument):
+            document = message.media.document
+            
+            # Solo consideramos videos (tipo de mime 'video/mp4' o similar)
+            is_video = any(attr.to_dict().get('_') == 'DocumentAttributeVideo' for attr in document.attributes)
+            if not is_video:
+                continue
+
+            # Obtener el nombre del archivo (si está disponible) o generar uno
+            file_name = next((attr.file_name for attr in document.attributes if hasattr(attr, 'file_name')), f"movie_{message.id}.mp4")
+            
+            # Para evitar conflictos y simplificar, se usará un nombre de archivo único basado en el ID del mensaje
+            unique_filename = f"movie_{message.id}_{file_name}"
+            
+            # --- NOTA CRUCIAL: Solo recopilamos los datos, la descarga se hace AL ELEGIR ---
+            # La descarga es pesada, no queremos descargar 10 películas.
+            
+            movie_info = {
+                "id": message.id,
+                "title": file_name,
+                "description": message.message,
+                "date": message.date.isoformat(),
+                "size_mb": round(document.size / (1024 * 1024), 2),
+                "download_status": "PENDING" # Marcamos que está pendiente de descarga
+            }
+            found_movies.append(movie_info)
+
+    return {"status": "ok", "query": query, "channel": MOVIE_CHANNEL_NAME, "results": found_movies}
+
+async def _download_and_get_url(message_id: int):
+    """
+    Descarga un mensaje específico y devuelve la URL pública.
+    """
+    if not await client.is_user_authorized():
+        return {"status": "error", "message": "Cliente no autorizado. Por favor, inicie sesión."}
+
+    try:
+        # Obtener el mensaje por ID
+        message = await client.get_messages(MOVIE_CHANNEL_ID_FOR_TELETHON, ids=message_id)
+        
+        if not message or not message.media or not isinstance(message.media, MessageMediaDocument):
+            return {"status": "error", "message": f"Mensaje (ID: {message_id}) no encontrado o no contiene un documento/video válido."}
+            
+        document = message.media.document
+        
+        # Generar nombre de archivo único
+        file_name = next((attr.file_name for attr in document.attributes if hasattr(attr, 'file_name')), f"movie_{message.id}.mp4")
+        unique_filename = f"movie_{message.id}_{file_name}"
+        
+        # Path de descarga
+        saved_path = os.path.join(DOWNLOAD_DIR, unique_filename)
+        
+        # Verificar si ya existe para evitar la descarga
+        if os.path.exists(saved_path):
+            print(f"🎬 Archivo ya existe: {unique_filename}. Omitiendo descarga.")
+        else:
+            print(f"⬇️ Descargando película (ID: {message_id}) a {unique_filename}...")
+            # Descargar el medio (ESTO PUEDE TARDAR MUCHO)
+            saved_path = await client.download_media(message, file=saved_path)
+            
+        # Devolver la URL pública
+        public_url = f"{PUBLIC_URL}/files/{unique_filename}"
+        
+        return {
+            "status": "ok",
+            "message": "Descarga completada y URL generada.",
+            "movie_id": message_id,
+            "title": file_name,
+            "download_url": public_url,
+            "telegram_link": f"https://t.me/c/{str(MOVIE_CHANNEL_ID_FOR_TELETHON)[4:]}/{message_id}"
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Error al descargar la película: {str(e)}"}
+
 # --- Rutas HTTP Base (Login/Status/General) ---
 
 @app.route("/")
 def root():
     return jsonify({
         "status": "ok",
-        "message": "Gateway API para LEDER DATA Bot activo. Consulta /status para la sesión.",
+        "message": "Gateway API para LEDER DATA Bot y Películas (Experimental) activo. Consulta /status para la sesión.",
     })
+
+# [EL RESTO DE RUTAS BASE Y COMANDOS DE LEDER DATA (/status, /login, /code, /send, /get, /files/<path:filename>, /dni, /dni_nombres, etc.) PERMANECEN INTACTAS AQUÍ]
 
 @app.route("/status")
 def status():
@@ -639,6 +734,8 @@ def status():
         "session_loaded": True if SESSION_STRING else False,
         "session_string": current_session,
         "bot_status": bot_status,
+        "movie_channel_id": MOVIE_CHANNEL_ID_FOR_TELETHON,
+        "movie_channel_name": MOVIE_CHANNEL_NAME,
     })
 
 @app.route("/login")
@@ -713,13 +810,71 @@ def files(filename):
     Ruta para descargar archivos. Se añade as_attachment=True para forzar la descarga 
     en lugar de visualizar el archivo, lo que es ideal para appcreator24.
     """
-    return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
+    # Se debe decodificar el nombre del archivo, ya que Telethon podría incluir caracteres especiales en el nombre
+    decoded_filename = unquote(filename)
+    return send_from_directory(DOWNLOAD_DIR, decoded_filename, as_attachment=True)
+
+
+# ----------------------------------------------------------------------
+# --- RUTAS NUEVAS PARA PELÍCULAS (EXPERIMENTAL) -----------------------
+# ----------------------------------------------------------------------
+
+@app.route("/peliculas/buscar", methods=["GET"])
+def api_buscar_pelicula():
+    """
+    Busca películas en el canal privado usando la función de búsqueda interna de Telegram.
+    Devuelve una lista de resultados, pero NO las descarga.
+    """
+    query = request.args.get("query")
+    if not query:
+        return jsonify({"status": "error", "message": "Parámetro 'query' (nombre o descripción de la película) es requerido."}), 400
+
+    limit = request.args.get("limit", 10, type=int)
+    
+    try:
+        # Llama a la función asíncrona de búsqueda
+        result = run_coro(_search_movie_in_channel(query, limit))
+        
+        if result.get("status") == "error":
+            return jsonify(result), 400
+            
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error interno en la búsqueda: {str(e)}"}), 500
+
+@app.route("/peliculas/descargar", methods=["GET"])
+def api_descargar_pelicula():
+    """
+    Descarga la película por su ID de mensaje y devuelve la URL pública.
+    ADVERTENCIA: Esta operación puede ser muy lenta y consumir mucho ancho de banda.
+    """
+    message_id = request.args.get("message_id", type=int)
+    if not message_id:
+        return jsonify({"status": "error", "message": "Parámetro 'message_id' (ID del mensaje en el canal) es requerido. Obténlo de /peliculas/buscar."}), 400
+        
+    # Agregamos un timeout más largo para la descarga (ej: 5 minutos = 300 segundos)
+    try:
+        result = run_coro(
+            asyncio.wait_for(_download_and_get_url(message_id), timeout=300)
+        )
+        
+        if result.get("status") == "error":
+            return jsonify(result), 500
+            
+        return jsonify(result)
+        
+    except asyncio.TimeoutError:
+        return jsonify({"status": "error", "message": "Tiempo de espera agotado (5 minutos). La descarga de la película es demasiado lenta o falló la conexión."}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error interno en la descarga: {str(e)}"}), 500
+
 
 # ----------------------------------------------------------------------
 # --- Rutas HTTP de API (Comandos LEDER DATA) ----------------------------
 # ----------------------------------------------------------------------
 
-# --- 1. Handlers para comandos basados en DNI (8 dígitos) o 1 parámetro simple ---
+# [EL RESTO DE RUTAS DE COMANDO (/dni, /dnif, /c4, etc.) VAN AQUÍ]
 
 @app.route("/dni", methods=["GET"])
 @app.route("/dnif", methods=["GET"]) 
@@ -945,99 +1100,6 @@ def api_venezolanos_nombres():
         return jsonify({"status": "error", "message": f"Error interno: {str(e)}"}), 500
         
 # ----------------------------------------------------------------------
-# --- NUEVA API para Búsqueda de Películas en Canal Privado ------------
-# ----------------------------------------------------------------------
-
-async def _search_movies_in_channel(search_term: str):
-    """Realiza la búsqueda en el historial del canal privado."""
-    if not await client.is_user_authorized():
-        return {"status": "error", "message": "Cliente no autorizado. Por favor, inicie sesión."}
-
-    results = []
-    
-    try:
-        # 1. Obtener la entidad del canal. Esto FALLARÁ si el usuario no es miembro.
-        channel_entity = await client.get_entity(MOVIE_CHANNEL_HASH)
-        
-        # 2. Realizar la búsqueda en el historial del canal
-        # Usamos 'limit' para no saturar la búsqueda
-        messages_generator = client.iter_messages(
-            channel_entity, 
-            search=search_term, 
-            limit=MAX_MOVIE_RESULTS,
-            # Aseguramos que sea un mensaje que contenga texto
-            filter=None
-        )
-
-        async for message in messages_generator:
-            
-            # Solo procesar mensajes que contengan texto (descripción) y/o archivos (película)
-            if message.text or message.media:
-                
-                # Intentar obtener el nombre del archivo si es un documento (una película)
-                file_name = None
-                file_url = None
-                
-                if isinstance(message.media, MessageMediaDocument) and message.media.document and hasattr(message.media.document, 'attributes'):
-                    for attr in message.media.document.attributes:
-                        if hasattr(attr, 'file_name'):
-                            file_name = attr.file_name
-                            break
-                    # Creamos un link directo si es un archivo que se puede descargar (no lo descargaremos aquí)
-                    # NOTA: La descarga debe ser manejada por el cliente. Dejaremos un link de Telethon si es posible.
-                    # Por simplicidad y para no exponer la sesión, solo devolveremos el nombre/descripción.
-                    
-                # Si hay media, indicamos el tipo
-                media_type = "video" if message.media and (isinstance(message.media, MessageMediaDocument) or (hasattr(message.media, 'webpage') and hasattr(message.media.webpage, 'video'))) else "text_only"
-                
-                results.append({
-                    "message_id": message.id,
-                    "date": message.date.isoformat(),
-                    "text": message.text.strip() if message.text else "",
-                    "file_name": file_name,
-                    "media_type": media_type
-                })
-                
-                # Si ya tenemos el máximo de resultados, salimos
-                if len(results) >= MAX_MOVIE_RESULTS:
-                    break
-
-        if not results:
-            return {"status": "ok", "message": f"No se encontraron películas que coincidan con '{search_term}' en el canal.", "results": []}
-            
-        return {"status": "ok", "message": f"Se encontraron {len(results)} resultados para '{search_term}' en el canal.", "results": results}
-
-    except errors.ChannelPrivateError:
-         return {"status": "error", "message": f"Error: Su cuenta de Telegram NO es miembro del canal privado: {MOVIE_CHANNEL_HASH}. No se puede acceder al historial."}
-    except Exception as e:
-        print(f"Error en _search_movies_in_channel: {e}")
-        return {"status": "error", "message": f"Error interno al buscar películas: {str(e)}"}
-
-
-@app.route("/search_movies", methods=["GET"])
-def api_search_movies():
-    """Ruta para buscar películas por nombre/descripción en el canal privado."""
-    
-    query = unquote(request.args.get("query", "")).strip()
-    
-    if not query or len(query) < 3:
-        return jsonify({"status": "error", "message": "Parámetro 'query' (nombre/descripción de la película) es requerido y debe tener al menos 3 caracteres."}), 400
-
-    print(f"🎬 Solicitud de búsqueda de películas: {query}")
-    
-    try:
-        # Usamos un timeout más corto para la búsqueda de historial
-        result = run_coro(_search_movies_in_channel(query))
-        
-        if result.get("status") == "error":
-            return jsonify(result), 500 
-            
-        return jsonify(result)
-        
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"Error en la ejecución de la búsqueda: {str(e)}"}), 500
-
-# ----------------------------------------------------------------------
 # --- Inicio de la Aplicación ------------------------------------------
 # ----------------------------------------------------------------------
 
@@ -1048,15 +1110,19 @@ if __name__ == "__main__":
         if not run_coro(client.is_user_authorized()):
              run_coro(client.start())
              
-        # Esto ayuda a Telethon a resolver la entidad de ambos bots y el canal al inicio
+        # Esto ayuda a Telethon a resolver la entidad de ambos bots al inicio
         run_coro(client.get_entity(LEDERDATA_BOT_ID)) 
         run_coro(client.get_entity(LEDERDATA_BACKUP_BOT_ID)) 
+        
+        # Intenta resolver la entidad del canal de películas (si ya estás unido)
         try:
-             run_coro(client.get_entity(MOVIE_CHANNEL_HASH))
+             run_coro(client.get_entity(MOVIE_CHANNEL_ID_FOR_TELETHON))
+             print(f"✅ Entidad del canal de películas resuelta: {MOVIE_CHANNEL_NAME}")
         except Exception as e:
-             print(f"⚠️ Atención: Fallo al resolver entidad del canal de películas. Si no es miembro, la API fallará: {e}")
+             print(f"⚠️ No se pudo resolver la entidad del canal de películas. Asegúrate de que la sesión de Telethon esté unida. Error: {e}")
              
     except Exception:
         pass
     print(f"🚀 App corriendo en http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
+
