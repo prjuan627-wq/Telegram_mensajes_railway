@@ -4,16 +4,17 @@ import asyncio
 import threading
 import traceback
 import time
+import requests # Necesario para hacer la llamada GET a la API de guardar
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
-from telethon.errors.rpcerrorlist import UserBlockedError # Importar el error específico
+from telethon.errors.rpcerrorlist import UserBlockedError
 
 # --- Configuración ---
 
@@ -42,6 +43,9 @@ TIMEOUT_FAILOVER = 25
 # Tiempo de espera total para la llamada a la API. ESTE DEFINE CUANTO ESPERA POR TODOS LOS MENSAJES
 # Si el bot de respaldo se usa, tiene 40 segundos.
 TIMEOUT_TOTAL = 40 
+
+# API para guardar los datos
+SAVE_API_BASE_URL = "https://base-datos-consulta-pe.fly.dev/guardar"
 
 # --- Manejo de Fallos por Bot (Implementación de tu lógica) ---
 
@@ -153,6 +157,10 @@ def clean_and_extract(raw_text: str):
     dni_match = re.search(r"DNI\s*:\s*(\d{8})", text, re.IGNORECASE)
     if dni_match: fields["dni"] = dni_match.group(1)
     
+    # Extracción de RUC de 11 dígitos
+    ruc_match = re.search(r"RUC\s*:\s*(\d{11})", text, re.IGNORECASE)
+    if ruc_match: fields["ruc"] = ruc_match.group(1)
+
     # Extracción de tipo de foto para /dnif y /dnivaz (para etiquetar las URLs)
     # NOTA: Se usan 'rostro', 'huella', 'firma', 'adverso', 'reverso' del bot original
     photo_type_match = re.search(r"Foto\s*:\s*(rostro|huella|firma|adverso|reverso).*", text, re.IGNORECASE)
@@ -302,7 +310,190 @@ async def _on_new_message(event):
 
 client.add_event_handler(_on_new_message, events.NewMessage(incoming=True))
 
-# --- Función Central para Llamadas API (Comandos) ---
+# ----------------------------------------------------------------------
+# --- NUEVAS FUNCIONES PARA EL GUARDADO AUTOMÁTICO -----------------------
+# ----------------------------------------------------------------------
+
+def _extract_data_for_save(command: str, result: dict) -> tuple[str, dict] | tuple[None, None]:
+    """
+    Extrae el 'tipo' de archivo y los 'datos' clave para la API de guardado.
+
+    :param command: El comando original enviado al bot (e.g., '/dni 12345678').
+    :param result: El resultado JSON consolidado y exitoso del bot.
+    :return: Una tupla (tipo, datos) o (None, None) si no se puede mapear.
+    """
+    command_name = command.split(' ')[0].lstrip('/')
+    data_to_save = {}
+    tipo_archivo = None
+    
+    # Intentar obtener DNI o RUC del resultado consolidado
+    dni_val = result.get("dni")
+    ruc_val = result["fields"].get("ruc")
+
+    # Mapeo de comandos y extracción de datos
+    
+    # 1. RUC (Empresa/RUC) - Comandos: /ruc, /r, /tremp (Trabajadores por Empresa), /denp (Placa)
+    # Ya no existe /r ni /ruc en las rutas, así que se asume que si el resultado tiene RUC es una empresa
+    if ruc_val:
+        tipo_archivo = "empresa"
+        data_to_save["ruc"] = ruc_val
+        
+        # Extracción de razón social
+        rs_match = re.search(r"Razón Social\s*:\s*(.*)", result["message"])
+        if rs_match:
+            data_to_save["razon_social"] = rs_match.group(1).strip()
+            
+        # Extracción de actividad
+        act_match = re.search(r"Actividad Principal\s*:\s*(.*)", result["message"])
+        if act_match:
+            data_to_save["actividad"] = act_match.group(1).strip()
+            
+        # Si es /denp, también se añade la placa
+        if command_name == "denp" and len(command.split(' ')) > 1:
+            data_to_save["placa"] = command.split(' ')[1].strip()
+            tipo_archivo = "denuncia_placa" # Tipo personalizado
+            
+    # 2. DNI (Persona, Ficha C4, Antecedentes, etc.)
+    elif dni_val:
+        data_to_save["dni"] = dni_val
+        
+        # Mapeo por comandos específicos de DNI
+        if command_name in ["c4"]:
+            tipo_archivo = "ficha_c4"
+        elif command_name in ["dni", "dnif", "dnidb", "dnifdb", "dnivaz", "dnivam", "dnivel", "dniveln"]:
+            tipo_archivo = "persona"
+        elif command_name in ["antpen", "antpol", "antjud"]:
+            tipo_archivo = "antecedentes"
+        elif command_name in ["tra", "sue"]: # Trabajos o Sueldos
+            tipo_archivo = "trabajo"
+        elif command_name in ["fa", "fb", "fadb", "fbdb"]: # Familiares
+            tipo_archivo = "familia"
+        elif command_name in ["dend"]: # Denuncia DNI
+            tipo_archivo = "denuncia_dni"
+        elif command_name in ["meta"]: # Metadata
+            tipo_archivo = "metadata"
+        elif command_name in ["afp"]: # AFPs
+            tipo_archivo = "afp"
+        else:
+            tipo_archivo = "persona" # Default si tiene DNI
+            
+        # Extracción de nombre común (general para DNI)
+        nombre_match = re.search(r"Nombres\s*:\s*(.*)", result["message"])
+        apellido_p_match = re.search(r"Apellido Paterno\s*:\s*(.*)", result["message"])
+        apellido_m_match = re.search(r"Apellido Materno\s*:\s*(.*)", result["message"])
+        
+        nombre_completo = ""
+        if nombre_match:
+            nombre_completo += nombre_match.group(1).strip()
+        if apellido_p_match:
+            nombre_completo += " " + apellido_p_match.group(1).strip()
+        if apellido_m_match:
+            nombre_completo += " " + apellido_m_match.group(1).strip()
+            
+        if nombre_completo:
+             data_to_save["nombre"] = nombre_completo.strip()
+             
+        # Extracción de fecha de emisión (para C4/DNI)
+        emision_match = re.search(r"Fecha de Emisión\s*:\s*(\d{4}-\d{2}-\d{2})", result["message"])
+        if emision_match:
+            data_to_save["fecha_emision"] = emision_match.group(1)
+
+
+    # 3. Teléfono (Comandos: /tel, /telp, /osiptel, /claro, /entel)
+    elif command_name in ["tel", "telp", "osiptel", "claro", "entel"] and len(command.split(' ')) > 1:
+        tipo_archivo = "telefono"
+        
+        # El número de teléfono es el parámetro del comando
+        numero = command.split(' ')[1].strip()
+        data_to_save["numero"] = numero
+        
+        # Extracción de operador
+        op_match = re.search(r"Operador\s*:\s*(.*)", result["message"])
+        if op_match:
+            data_to_save["operador"] = op_match.group(1).strip()
+            
+        # Extracción de titular
+        titular_match = re.search(r"Titular\s*:\s*(.*)", result["message"])
+        if titular_match:
+            data_to_save["titular"] = titular_match.group(1).strip()
+        
+    # 4. Otros casos personalizados (ej: /cedula, /pasaporte)
+    elif command_name in ["cedula", "denpas", "denci"]:
+        
+        tipo_archivo = "extranjero"
+        if command_name == "denpas": tipo_archivo = "denuncia_pasaporte"
+        elif command_name == "denci": tipo_archivo = "denuncia_cedula"
+        
+        # El valor del documento es el parámetro del comando
+        doc_value = command.split(' ')[1].strip() if len(command.split(' ')) > 1 else ""
+        
+        if doc_value:
+             # Asignar el valor al tipo de documento correspondiente
+            if command_name == "cedula":
+                data_to_save["cedula"] = doc_value
+            elif command_name == "denpas":
+                data_to_save["pasaporte"] = doc_value
+            elif command_name == "denci":
+                data_to_save["cedula_identidad"] = doc_value
+                
+        # Intenta extraer el nombre
+        nombre_match = re.search(r"Nombre\s*:\s*(.*)", result["message"])
+        if nombre_match:
+            data_to_save["nombre"] = nombre_match.group(1).strip()
+            
+        
+    # Si logramos extraer datos, le añadimos un ID de marca de tiempo (simulado)
+    if data_to_save:
+        # Usamos un ID único basado en el tiempo para el ejemplo, como en tus ejemplos
+        data_to_save["id"] = int(time.time() * 1000)
+
+    # Si NO se puede mapear, devolvemos None, None
+    return (tipo_archivo, data_to_save)
+
+
+async def _guardar_datos_api(tipo: str, datos: dict):
+    """
+    Ejecuta la llamada GET a la API externa para guardar los datos.
+
+    :param tipo: Nombre del archivo/tipo de dato (e.g., 'persona', 'telefono').
+    :param datos: Diccionario de datos clave=valor a guardar.
+    """
+    if not tipo or not datos:
+        print("⚠️ No se puede guardar: Falta el tipo o los datos.")
+        return
+
+    try:
+        # Construir la URL de la API de guardado
+        query_params = []
+        for clave, valor in datos.items():
+            # URL-encode tanto la clave como el valor
+            encoded_valor = quote(str(valor))
+            query_params.append(f"{clave}={encoded_valor}")
+        
+        full_url = f"{SAVE_API_BASE_URL}/{tipo}?{'&'.join(query_params)}"
+        
+        # Ejecutar la petición GET (Bloqueante, debe hacerse en un thread o con aiohttp, 
+        # pero para simplicidad con requests en un thread/executor)
+        # Usaremos el executor del loop de asyncio para hacer la llamada bloqueante
+        response = await loop.run_in_executor(
+            None, # Usa el ThreadPoolExecutor por defecto
+            lambda: requests.get(full_url, timeout=15) # 15 segundos de timeout para la API de guardado
+        )
+        
+        # Registrar el resultado (No es necesario devolverlo, solo para depuración)
+        if response.status_code == 200:
+            print(f"✅ Datos guardados con éxito en la API /{tipo}. Respuesta: {response.json().get('message', 'Sin mensaje')}")
+        else:
+            print(f"❌ Error al guardar en la API /{tipo}. Estado: {response.status_code}. Respuesta: {response.text}")
+
+    except requests.exceptions.Timeout:
+        print(f"❌ Timeout al intentar guardar en la API /{tipo}.")
+    except Exception as e:
+        print(f"❌ Error interno al guardar en la API /{tipo}: {e}")
+        
+# ----------------------------------------------------------------------
+# --- FUNCIÓN CENTRAL MODIFICADA ---------------------------------------
+# ----------------------------------------------------------------------
 
 async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
     """Envía un comando al bot y espera la respuesta(s), con lógica de respaldo y bloqueo por fallo."""
@@ -484,6 +675,22 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
                 final_json["status"] = "ok"
                 final_json["bot_used"] = current_bot_id
                 
+                # ----------------------------------------------------------------------
+                # >>> LÓGICA DE GUARDADO AUTOMÁTICO (¡AÑADIDO AQUÍ!) <<<
+                # ----------------------------------------------------------------------
+                try:
+                    tipo, datos = _extract_data_for_save(command, final_json)
+                    if tipo and datos:
+                        # Ejecutar la función de guardado en segundo plano
+                        # Usamos create_task para que NO BLOQUEE la respuesta al cliente API
+                        asyncio.create_task(_guardar_datos_api(tipo, datos))
+                        print(f"💾 Tarea de guardado de datos ({tipo}) iniciada en segundo plano.")
+                    else:
+                        print("⚠️ Datos no mapeados para guardado automático. Omitiendo.")
+                except Exception as save_e:
+                    print(f"❌ Error al iniciar la tarea de guardado: {save_e}")
+                # ----------------------------------------------------------------------
+
                 return final_json
                 
             # Si list_of_messages está vacío
