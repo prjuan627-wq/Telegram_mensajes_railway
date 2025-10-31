@@ -4,18 +4,16 @@ import asyncio
 import threading
 import traceback
 import time
-import json # Importar json para serialización
-import requests # Importar requests para la llamada a la API de guardado
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from urllib.parse import unquote, urlencode # Importar urlencode
+from urllib.parse import unquote
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
-from telethon.errors.rpcerrorlist import UserBlockedError
+from telethon.errors.rpcerrorlist import UserBlockedError # Importar el error específico
 
 # --- Configuración ---
 
@@ -25,12 +23,6 @@ API_HASH = os.getenv("API_HASH", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://consulta-pe-bot.up.railway.app").rstrip("/")
 SESSION_STRING = os.getenv("SESSION_STRING", None)
 PORT = int(os.getenv("PORT", 8080))
-
-# --- Configuración de la API de Guardado ---
-SAVE_DB_URL = "https://base-datos-consulta-pe.fly.dev/guardar/"
-# El ID para garantizar unicidad, ya que la API de guardado lo requiere.
-# Se inicializa a un valor base.
-global_save_id = int(time.time() * 1000)
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -310,119 +302,6 @@ async def _on_new_message(event):
 
 client.add_event_handler(_on_new_message, events.NewMessage(incoming=True))
 
-# --- Función de Guardado en DB (NUEVA FUNCIÓN) ---
-
-def _save_result_to_db_sync(data_to_save: dict):
-    """
-    Función síncrona para guardar datos en la API, ejecutada en un hilo o executor.
-    """
-    global global_save_id
-    
-    # 1. Determinar el TIPO (nombre del archivo)
-    command = data_to_save.get("command", "").lstrip("/").split()[0].lower()
-    
-    # Mapeo de comandos a tipos de archivo
-    type_mapping = {
-        "dni": "persona", "dnif": "persona", "dnidb": "persona", "dnifdb": "persona", 
-        "c4": "ficha_c4", "dnivaz": "persona", "dnivam": "persona", "dnivel": "persona", 
-        "dniveln": "persona", "fa": "firma", "fb": "firma", "fadb": "firma", "fbdb": "firma",
-        "tra": "trabajo", "tremp": "trabajo_empresa", "sue": "sueldo",
-        "cla": "constancia_logros", "sune": "titulo_universitario", "cun": "carnet_universitario",
-        "colp": "colegiado", "mine": "titulo_instituto", "pasaporte": "pasaporte",
-        "afp": "afp", "bdir": "direccion_inversa", "meta": "metadata", "fis": "fiscalia",
-        "det": "detenido", "rqh": "requisitoria_historica", "antpenv": "antecedentes_verificador",
-        "agv": "arbol_genealogico", "agvp": "arbol_genealogico_profesional", "cedula": "venezolano_cedula",
-        "tel": "telefono", "telp": "telefono", "cor": "correo", "nmv": "venezolano_nombres", 
-        "osiptel": "osiptel", "claro": "telefono", "entel": "telefono", "pro": "propiedad", 
-        "sen": "sentinel", "sbs": "sbs", "seeker": "seeker", "fisdet": "fiscalia_detallado",
-        "dend": "denuncia_dni", "dence": "denuncia_ce", "denpas": "denuncia_pasaporte",
-        "denci": "denuncia_ci", "denp": "denuncia_placa", "denar": "denuncia_armamento", 
-        "dencl": "denuncia_clave", 
-        "ruc": "empresa", # Se asume que /ruc existe o se agregará
-    }
-    
-    tipo_guardado = type_mapping.get(command, "general")
-    
-    # 2. Preparar los PARÁMETROS de guardado
-    params = {}
-    
-    # Aumentar y asignar el ID global para la unicidad
-    global_save_id += 1
-    params["id"] = global_save_id
-    params["fecha_guardado"] = datetime.now().isoformat()
-    params["comando_usado"] = data_to_save.get("command")
-    
-    # Datos específicos del resultado
-    result_data = data_to_save.get("result", {})
-    
-    # Intentar obtener los campos principales desde 'result'
-    if result_data.get("dni"):
-        params["dni"] = result_data["dni"]
-    if result_data.get("ruc"):
-        params["ruc"] = result_data["ruc"]
-        tipo_guardado = "empresa" # Forzar tipo si hay RUC
-    
-    # Extracción inteligente de datos del 'message'
-    message_text = result_data.get("message", "")
-    
-    # Función de ayuda para extraer valores
-    def extract_field(regex, text):
-        match = re.search(regex, text, re.IGNORECASE)
-        return match.group(1).strip() if match else None
-
-    # Extracción de campos clave del texto del mensaje
-    if not params.get("dni"):
-        params["dni"] = extract_field(r"DNI\s*:\s*(\d{8})", message_text)
-        
-    if not params.get("ruc") and tipo_guardado == "empresa":
-        params["ruc"] = extract_field(r"RUC\s*:\s*(\d+)", message_text)
-    
-    # Campos comunes: nombre, razón social, número de teléfono
-    params["nombre_completo"] = extract_field(r"Nombre(s)?\s*(y\s*Apellidos)?\s*:\s*(.+)", message_text)
-    params["razon_social"] = extract_field(r"Razón\s*Social\s*:\s*(.+)", message_text)
-    params["numero_telefono"] = extract_field(r"Número\s*:\s*(\d+)", message_text)
-    
-    # Si es una consulta de teléfono (/tel, /claro, etc.), asegurarse de guardar el número consultado.
-    if tipo_guardado == "telefono" and len(data_to_save.get("command").split()) > 1:
-        param_consultado = data_to_save.get("command").split()[1]
-        if param_consultado.isdigit() and len(param_consultado) in [9, 11]:
-             params["numero_consultado"] = param_consultado
-    
-    # Guardar URLs (fotos/archivos) como JSON string
-    if result_data.get("urls"):
-        params["urls"] = json.dumps(result_data["urls"])
-        
-    # Guardar el mensaje completo como referencia
-    params["respuesta_completa"] = message_text
-    
-    # Filtrar parámetros vacíos
-    clean_params = {k: v for k, v in params.items() if v is not None and v != ""}
-    
-    # 3. Construir la URL final
-    final_url = f"{SAVE_DB_URL}{tipo_guardado}?{urlencode(clean_params)}"
-    
-    # 4. Enviar la solicitud GET
-    try:
-        # Se usa un timeout bajo para no bloquear si la API de guardado falla
-        response = requests.get(final_url, timeout=5) 
-        response.raise_for_status() # Lanza excepción para códigos 4xx/5xx
-        print(f"✅ Guardado automático exitoso para {data_to_save.get('command')}. Tipo: {tipo_guardado}")
-    except requests.exceptions.Timeout:
-        print(f"⚠️ Guardado automático fallido por Timeout (5s) para {tipo_guardado}.")
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Guardado automático fallido por error de conexión o API: {e}")
-
-async def _save_result_to_db(data_to_save: dict):
-    """
-    Wrapper asíncrono que ejecuta la función síncrona en el ThreadPoolExecutor.
-    Esto evita que la llamada a requests.get bloquee el loop principal de asyncio.
-    """
-    try:
-        # Ejecutar la función síncrona en el executor por defecto del loop.
-        await loop.run_in_executor(None, _save_result_to_db_sync, data_to_save)
-    except Exception as e:
-        print(f"Error en la ejecución del guardado en el executor: {e}")
-
 # --- Función Central para Llamadas API (Comandos) ---
 
 async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
@@ -604,17 +483,6 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
                 # Si la consulta fue exitosa con al menos 1 mensaje
                 final_json["status"] = "ok"
                 final_json["bot_used"] = current_bot_id
-                
-                # ----------------------------------------------------------------------
-                # >>> INTEGRACIÓN DE GUARDADO AUTOMÁTICO (NUEVO) <<<
-                # ----------------------------------------------------------------------
-                save_data = {
-                    "command": command,
-                    "result": final_json.copy()
-                }
-                # Llamar al guardado de forma asíncrona para no bloquear la respuesta HTTP
-                asyncio.create_task(_save_result_to_db(save_data))
-                # ----------------------------------------------------------------------
                 
                 return final_json
                 
@@ -892,10 +760,6 @@ def files(filename):
 @app.route("/agv", methods=["GET"]) # ÁRBOL GENEALÓGICO VISUAL (AGREGADO)
 @app.route("/agvp", methods=["GET"]) # ÁRBOL GENEALÓGICO VISUAL PROFESIONAL (AGREGADO)
 @app.route("/cedula", methods=["GET"]) # VENEZOLANOS CEDULA (AGREGADO)
-@app.route("/ruc", methods=["GET"]) # RUC (AGREGADO)
-@app.route("/tel", methods=["GET"]) # TELÉFONO (AGREGADO)
-@app.route("/telp", methods=["GET"]) # TELÉFONO PROPIETARIO (AGREGADO)
-@app.route("/cor", methods=["GET"]) # CORREO (AGREGADO)
 def api_dni_based_command():
     """
     Maneja comandos que solo requieren un DNI o un parámetro simple.
@@ -914,7 +778,7 @@ def api_dni_based_command():
     
     # Comandos que esperan un parámetro de consulta genérico (query)
     query_required_commands = [
-        "tel", "telp", "cor", "nmv", "tremp", "ruc",
+        "tel", "telp", "cor", "nmv", "tremp", 
         # LOS 7 NUEVOS COMANDOS (excepto /rqh y /fisdet, que ya están arriba o se manejan especial)
         "fisdet", # DETALLADO
         "dence", "denpas", "denci", "denp", "denar", "dencl", 
@@ -935,18 +799,20 @@ def api_dni_based_command():
         
         param_value = None
         
-        # --- Lógica específica para los comandos de query ---
+        # --- Lógica específica para los 7 comandos ---
         if command_name == "fisdet":
             # Formato: /fisdet <caso|distritojudicial>
+            # Buscamos 'dni' (o caso/distritojudicial) o 'query'
             param_value = request.args.get("caso") or request.args.get("distritojudicial") or request.args.get("query")
             
+            # Si el usuario usa el formato 'dni|detalle' (aunque el nuevo formato pide caso/distrito)
             if not param_value:
                 dni_val = request.args.get("dni")
                 det_val = request.args.get("detalle")
                 if dni_val and det_val:
                     param_value = f"{dni_val}|{det_val}"
                 elif dni_val:
-                    param_value = dni_val
+                    param_value = dni_val # Usar solo DNI si detalle no está
         
         elif command_name == "dence":
             param_value = request.args.get("carnet_extranjeria")
@@ -960,14 +826,10 @@ def api_dni_based_command():
             param_value = request.args.get("serie_armamento")
         elif command_name == "dencl":
             param_value = request.args.get("clave_denuncia")
+            
+        # --- Lógica para otros comandos de query ---
         elif command_name == "cedula":
             param_value = request.args.get("cedula")
-        elif command_name == "ruc":
-            param_value = request.args.get("ruc")
-        elif command_name in ["tel", "telp"]:
-             param_value = request.args.get("telefono") or request.args.get("numero") or request.args.get("query")
-        elif command_name == "cor":
-             param_value = request.args.get("correo") or request.args.get("email") or request.args.get("query")
         
         # Si no se encontró el parámetro específico, usamos 'query' (o dni de fallback)
         param = param_value or request.args.get("dni") or request.args.get("query")
@@ -1084,4 +946,3 @@ if __name__ == "__main__":
         pass
     print(f"🚀 App corriendo en http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
-
