@@ -1,0 +1,37 @@
+# fly.toml app configuration file generated for consulta-pe-telegram-bot-railway
+#
+# See https://fly.io/docs/reference/configuration/ for information about this file.
+#
+
+app = "consulta-pe-telegram-bot-railway"
+primary_region = "lim" # Región primaria (Lima)
+
+[build]
+  # Configuración para usar Buildpacks de Paketo
+  builder = "paketobuildpacks/builder-jammy-base"
+  buildpacks = ["gcr.io/paketo-buildpacks/python"]
+  
+[env]
+  # Variables de ambiente por defecto. Las sensibles van en Fly Secrets.
+  PORT = "8080" 
+  # NOTA: PUBLIC_URL debe configurarse como un Secret en la terminal
+  # fly secrets set PUBLIC_URL="https://consulta-pe-telegram-bot-railway.fly.dev"
+
+# Configuración HTTP para exponer el puerto 8080
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+  
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 25
+    soft_limit = 20
+
+# Montar un volumen persistente para la carpeta 'downloads'
+[mounts]
+  source="consulta_pe_volume" 
+  destination="/app/downloads"
